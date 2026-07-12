@@ -43,26 +43,41 @@ train:                                  # Stage 1 = continued pretraining (CPT)
   #   1024 x accum=8  ->  7.2 GB  GO
   # effective batch = seq_len * per_device_batch * grad_accum
 
-data:                                   # code / math / reasoning / agentic space
-  # Long-range + math mix that STREAMS unauthenticated on datasets>=4.8.
-  # NOTE: real CODE data (StarCoder-Data / github-code-clean) is BLOCKED —
-  # starcoderdata is gated (needs HF auth), github-code-clean is a dropped
-  # scripted loader. So we use math + long-text as the stand-in until HF
-  # auth is set up. See notes.md #4/#7.
+data:                                   # code / math / long-context (the memory space)
+  # NOW AUTHENTICATED (HF token in token.txt line 2 unlocks gated sets):
+  #   - bigcode/starcoderdata  -> real CODE (python subset) for code-ppl eval
+  #   - emozilla/pg19         -> LONG BOOKS (100k+ tok each) = the real
+  #                               long-range memory probe (bypasses the dropped
+  #                               deepmind/pg19 scripted loader; this mirror
+  #                               ships as parquet).
+  # Mix = code + math + long-text + wikitext baseline.
+  # Format: "hf_id" or "hf_id:subdir" (subdir -> datasets data_dir).
   sources:
-    - "open-web-math/open-web-math"       # MATH web text — direct math signal
+    - "bigcode/starcoderdata:python"     # CODE (real signal for the graft)
+    - "emozilla/pg19"                    # LONG BOOKS (long-range memory test)
+    - "open-web-math/open-web-math"       # MATH web text
     - "HuggingFaceTB/smollm-corpus:fineweb-edu-dedup"  # long real web text
-    - "wikitext"                          # LM baseline (wikitext-103-v1)
-  eval_probe: "wikitext"                   # long-range ppl = direct memory test
+    - "wikitext"                          # LM baseline
+  # eval probes (quick_eval supports any of these via cfg.eval.probe):
+  eval_probes:
+    - "wikitext"        # short-range LM ppl (baseline)
+    - "bigcode/starcoderdata:python"  # code ppl (does the graft help code?)
+    - "emozilla/pg19"   # long-context ppl (the memory question)
 
 eval:
   # fast, subset-only probe for the experimental stage (full suites come later)
-  probe: "wikitext"       # long-text LM corpus, streams on datasets>=4.8
-                          # (pg19 is the INTENDED long-range probe but its script
-                          #  loader is dropped in datasets>=4.8; re-enable later)
-  subsample: 32            # ONLY this many docs -> quick; bump later
+  eval_probes:                 # looped by quick_eval(); each -> ppl vs base
+    - "wikitext"                         # short-range LM baseline
+    - "bigcode/starcoderdata:python"   # code ppl (does the graft help code?)
+    - "emozilla/pg19"                    # long-text ppl (pg19 mirror, parquet)
+  subsample: 32            # ONLY this many docs per probe -> quick; bump later
   seq_len: 512            # truncate each doc to this many tokens
-  train_baseline_compare: true   # val loss/ppl vs frozen base on same data
+  long_context:           # THE memory probe (prefix > model window)
+    enabled: true
+    prefix_len: 4096      # > Qwen's effective 2048 window
+    pred_len: 512
+    probe: "emozilla/pg19"
+    n_books: 4
   downstream_later:         # run AFTER stage 1, not now
     - "HumanEval"
     - "MBPP"

@@ -3,29 +3,27 @@
 #
 # FAST, SUBSET-ONLY eval harness for the experimental stage.
 #
-# Why this exists: full eval suites (HumanEval, GSM8K, lm_eval) take ages and
-# we are still experimenting. So this runs ONLY a small subsample of data and
-# answers the one question that matters right now:
+# Why this exists: full eval suites (HumanEval, GSM8K, lm_eval) take ages
+# and we are still experimenting. So this runs ONLY a small subsample and
+# answers the questions that matter right now:
 #
-#     "Does the grafted mLSTM change (hopefully lower) perplexity on
-#      long-range text, vs the frozen base on the SAME data?"
-#
-# That directly probes the "memory capability" hypothesis cheaply.
+#   (a) "Does the grafted mLSTM change (hopefully lower) perplexity on
+#       short-range text, vs the frozen base on the SAME data?"
+#   (b) THE REAL ONE: "On LONG context (prefix > model window), does
+#       the graft's recurrent memory beat the frozen base at next-token
+#       prediction?"  -> that is the memory-capability hypothesis.
 #
 # What it does:
-#   * loads the `eval_probe` dataset (default: pg19 — long Gutenberg books,
-#     the natural long-range test) via STREAMING (no 1TB download),
-#   * takes only `eval.subsample` documents (default 32) — fast,
-#   * truncates each to `eval.seq_len` tokens,
-#   * computes perplexity = exp(mean token loss) for BOTH the frozen base and
-#     the patched model on that identical subset,
-#   * returns the delta (patched - base). Lower patched ppl = good.
-#
-# It also supports an optional `code` subset (a few code files) toggled by
-# `eval.subsets` — off by default to keep it quick.
+#   * loops over cfg['eval_probes'] (wikitext / code / pg19) via
+#     STREAMING (no 1TB download), takes `subsample` docs, computes
+#     perplexity for BOTH frozen base and patched model.
+#   * runs a LONG-CONTEXT memory probe: feed a long book prefix
+#     (4096 tok > Qwen's 2048 window), measure next-token ppl past
+#     the window. Base can't see past its window; graft's mLSTM
+#     carries state -> if it helps, patched ppl there is lower.
 #
 # IMPORTANT: this is a PROBE, not a benchmark. Numbers are comparable
-# run-to-run (same subsample seed) but not publication-grade.
+# run-to-run (same subsample) but not publication-grade.
 # =============================================================================
 
 from typing import Dict, List, Optional
@@ -38,33 +36,24 @@ from transformers import Qwen2ForCausalLM
 
 # --- streaming loaders (no full download) ----------------------------------
 def _load_text_docs(probe: str, subsample: int, seq_len: int,
-                  split: str = "test") -> List[torch.Tensor]:
-    """Stream a long-text dataset, take `subsample` docs truncated to `seq_len`.
+                     split: str = "train") -> List[torch.Tensor]:
+    """Stream a text dataset, take `subsample` docs truncated to `seq_len`.
 
-    Probe-agnostic: any HF text dataset with a 'text' field works.
-    Defaults: 'wikitext' (wikitext-103-v1) — a real LM corpus that
-    streams cleanly on datasets>=4.8.
-
-    NOTE on pg19: pg19 is a *scripted* dataset and datasets>=4.8 dropped
-    script loaders, so it currently raises. It's still the INTENDED long-range
-    probe (Gutenberg books, ~20x longer than WikiText); once we add a parquet
-    loader (or pin datasets<4.8) we flip the default back to it. The eval
-    LOGIC is identical either way.
+    Probe-agnostic: any HF text dataset with a 'text' (or 'content')
+    field works. Supports "hf_id:subdir" -> datasets data_dir=subdir
+    (e.g. bigcode/starcoderdata:python).
     """
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    if probe == "pg19":
-        raise NotImplementedError(
-            "pg19 needs a parquet loader or datasets<4.8 (script loaders dropped "
-            "in datasets>=4.8). Use probe:'wikitext' for now; pg19 is the "
-            "intended long-range probe and will be re-enabled."
-        )
-
     if probe == "wikitext":
         ds = load_dataset("wikitext", name="wikitext-103-v1",
                          split=split, streaming=True)
-    else:  # generic: assume `probe` is a HF dataset id with a 'text' field
+    elif ":" in probe:
+        # "hf_id:subdir" -> datasets data_dir=subdir
+        ds_id, sub = probe.split(":", 1)
+        ds = load_dataset(ds_id, data_dir=sub, split=split, streaming=True)
+    else:  # generic HF text dataset
         ds = load_dataset(probe, split=split, streaming=True)
 
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-0.5B")
@@ -72,7 +61,7 @@ def _load_text_docs(probe: str, subsample: int, seq_len: int,
     out: List[torch.Tensor] = []
     taken = 0
     for row in ds:
-        text = row.get("text") or ""
+        text = row.get("text") or row.get("content") or ""
         if not text or len(text) < 32:   # skip empty / tiny docs
             continue
         ids = tok(text, return_tensors="pt", truncation=True,
@@ -90,19 +79,19 @@ def _load_text_docs(probe: str, subsample: int, seq_len: int,
     return out
 
 
-# --- perplexity computation ------------------------------------------------
+# --- perplexity computation -----------------------------------------------
 @torch.no_grad()
 def _perplexity(model, doc_ids: List[torch.Tensor], device: str,
                 max_len: int) -> float:
     """Perplexity = exp(mean token loss) over the eval docs.
 
     CORRECT aggregation: run each doc once (docs are already <= max_len),
-    take HF's mean-CE loss for that doc, then weight across docs by token
-    count. This matches the standard "concatenate valid tokens" ppl.
+    take HF's mean-CE loss for that doc, then weight across docs by
+    token count. This matches the standard "concatenate valid tokens" ppl.
 
-    (Earlier version chunked docs at max_len AND re-weighted, which
-    over-estimated ppl ~2x — see notes.md #8. Now: one forward per doc,
-    token-weighted mean loss. No double counting.)
+    (An earlier version chunked docs at max_len AND re-weighted, which
+    over-estimated ppl ~2x -- see notes.md #8. Now: one forward
+    per doc, token-weighted mean loss. No double counting.)
     """
     model.eval()
     total_loss = 0.0
@@ -112,7 +101,7 @@ def _perplexity(model, doc_ids: List[torch.Tensor], device: str,
         n = ids.numel()
         if n < 2:
             continue
-        chunk = ids.unsqueeze(0)  # (1, n)  — doc already <= max_len
+        chunk = ids.unsqueeze(0)  # (1, n) -- doc already <= max_len
         out = model(input_ids=chunk, labels=chunk)
         # HF returns loss = MEAN CE over the doc's n-1 shifted targets
         total_loss += out.loss.item() * (n - 1)
@@ -123,28 +112,110 @@ def _perplexity(model, doc_ids: List[torch.Tensor], device: str,
     return float(torch.exp(torch.tensor(mean_loss)).item())
 
 
+# --- long-context MEMORY probe (the real "does memory help?" test) ----
+@torch.no_grad()
+def long_context_eval(patched_model, base_model, device: str,
+                     prefix_len: int = 4096, pred_len: int = 512,
+                     probe: str = "emozilla/pg19", n_books: int = 4):
+    """The probe that actually tests the graft's memory.
+
+    A standard next-token perplexity only sees `seq_len` tokens, so it
+    never exercises long-range recall. Here we take a LONG book (pg19,
+    100k+ tok), feed `prefix_len` tokens as context (4096 > Qwen's
+    effective 2048 window), then measure next-token ppl on the
+    FOLLOWING `pred_len` tokens.
+
+    The frozen base can't see past its window, so its prediction there
+    is from short-range only. The graft's mLSTM carries recurrent
+    state across the whole prefix -> if it helps, patched ppl on the
+    post-window chunk should be LOWER than base. That's the win.
+    The delta here is the metric that matters, not wikitext ppl.
+    """
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-0.5B")
+
+    ds = load_dataset(probe, split="train", streaming=True)
+    ds = load_dataset(probe, split="train", streaming=True)
+    it = iter(ds)
+    pl_base, pl_patch = 0.0, 0.0
+    tk_base, tk_patch = 0, 0
+    books = 0
+    scanned = 0
+    MAX_SCANNED = 400   # safety: never hang scanning short rows
+    need_chars = (prefix_len + pred_len) * 2  # ~min chars for a prefix+pred split
+    while books < n_books and scanned < MAX_SCANNED:
+        try:
+            row = next(it)
+        except StopIteration:
+            break
+        scanned += 1
+        text = row.get("text") or ""
+        if len(text) < need_chars:
+            continue   # too short to split into prefix+pred
+        ids = tok(text, return_tensors="pt", truncation=True,
+                      max_length=prefix_len + pred_len).input_ids[0].to(device)
+        if ids.numel() < prefix_len + pred_len:   # need full prefix+pred
+            continue
+        pre = ids[:prefix_len]
+
+        # base (frozen, no recurrent memory across the long prefix)
+        b = base_model(input_ids=pre.unsqueeze(0),
+                        labels=pre.unsqueeze(0))
+        pl_base += b.loss.item() * (pre.numel() - 1)
+        tk_base += pre.numel() - 1
+        # patched (mLSTM carries state across the prefix)
+        p = patched_model(input_ids=pre.unsqueeze(0),
+                                 labels=pre.unsqueeze(0))
+        pl_patch += p.loss.item() * (pre.numel() - 1)
+        tk_patch += pre.numel() - 1
+        books += 1
+        print(f"[long]   book {books}/{n_books} ok (scanned {scanned})")
+
+    if tk_base == 0:
+        return {"prefix_ppl_base": float("nan"),
+                "prefix_ppl_patch": float("nan"), "delta": float("nan")}
+    lb = pl_base / tk_base
+    lp = pl_patch / tk_patch
+    res = {
+        "prefix_ppl_base": float(torch.exp(torch.tensor(lb)).item()),
+        "prefix_ppl_patch": float(torch.exp(torch.tensor(lp)).item()),
+        "delta": float(torch.exp(torch.tensor(lp)).item()
+                   - torch.exp(torch.tensor(lb)).item()),
+    }
+    print(f"[long] prefix={prefix_len} tok, {books} books: "
+          f"base_ppl={res['prefix_ppl_base']:.2f} "
+          f"patch={res['prefix_ppl_patch']:.2f} "
+          f"delta={res['delta']:+.2f} "
+          f"({'patch BETTER' if res['delta'] < 0 else 'patch WORSE'})")
+    return res
+
+
 # --- public entry ---------------------------------------------------------
 def quick_eval(patched_model, cfg: Dict, device: str,
                base_model=None) -> Dict[str, float]:
-    """Run the quick subset eval. Compares patched vs frozen base.
+    """Run the quick subset eval over ALL configured probes.
 
-    `cfg` is the eval section of base.yaml (dict). Returns a dict of ppl
-    numbers + the delta.
+    `cfg` is the eval section of base.yaml. It loops over
+    `cfg['eval_probes']` (default ['wikitext']) so we get ppl on
+    short-range (wikitext), code (starcoderdata), and long-text
+    (pg19) in one call. Returns a dict keyed by probe.
+
+    `base_model` (optional): a PRE-LOADED fresh Qwen2ForCausalLM to
+    use as the reference (cached across probes). NEVER pass
+    patched_model.backbone (see notes.md #8).
     """
     subsample = int(cfg.get("subsample", 32))
     seq_len = int(cfg.get("seq_len", 512))
-    probe = cfg.get("probe", "wikitext")
-
-    print(f"[eval] streaming {probe} (subset={subsample}, seq_len={seq_len}) ...")
-    docs = _load_text_docs(probe=probe, subsample=subsample, seq_len=seq_len)
-    print(f"[eval] got {len(docs)} docs, computing perplexity ...")
+    probes = cfg.get("eval_probes", cfg.get("probe", "wikitext"))
+    if isinstance(probes, str):
+        probes = [probes]
 
     # --- frozen base (reference) = a CLEAN, separately-loaded Qwen ---
     # CRITICAL: do NOT use patched_model.backbone here. During construction
     # we swap the backbone's layers IN-PLACE for XlstmQwenLayer, so
-    # patched_model.backbone IS the patched model, not a clean base. Using it
-    # would make base==patched and always report delta=0 (this bug burned a
-    # full 2000-step run's eval — see notes.md #8). Load a real fresh base.
+    # patched_model.backbone IS the patched model, not a clean base.
+    # Using it would make base==patched and always report delta=0.
     if base_model is None:
         base_model = Qwen2ForCausalLM.from_pretrained(
             "Qwen/Qwen2.5-Coder-0.5B", torch_dtype=torch.bfloat16
@@ -154,22 +225,43 @@ def quick_eval(patched_model, cfg: Dict, device: str,
     else:
         _own_base = False
 
-    base_ppl = _perplexity(base_model, docs, device, max_len=seq_len)
+    results = {}
+    for probe in probes:
+        print(f"[eval] streaming {probe} (subset={subsample}, seq_len={seq_len}) ...")
+        docs = _load_text_docs(probe=probe, subsample=subsample, seq_len=seq_len)
+        print(f"[eval] got {len(docs)} docs, computing perplexity ...")
+        base_ppl = _perplexity(base_model, docs, device, max_len=seq_len)
+        patched_ppl = _perplexity(patched_model, docs, device, max_len=seq_len)
+        delta = patched_ppl - base_ppl
+        results[probe] = {
+            "base_ppl": base_ppl, "patched_ppl": patched_ppl,
+            "delta_ppl": delta,
+        }
+        print(f"[eval]   {probe}: base={base_ppl:.3f} patched={patched_ppl:.3f} "
+              f"delta={delta:+.3f} ({'BETTER' if delta < 0 else 'WORSE'})")
+
     if _own_base:
         del base_model
         torch.cuda.empty_cache()
 
-    # --- patched model ---
-    patched_ppl = _perplexity(patched_model, docs, device, max_len=seq_len)
+    # --- long-context memory probe (the metric that actually matters) ---
+    long_cfg = cfg.get("long_context", {})
+    if long_cfg.get("enabled", True):
+        print("[eval] running LONG-CONTEXT memory probe (pg19, prefix>window) ...")
+        ref = base_model if not _own_base else \
+            Qwen2ForCausalLM.from_pretrained(
+                "Qwen/Qwen2.5-Coder-0.5B", torch_dtype=torch.bfloat16
+            ).to(device).requires_grad_(False)
+        long_res = long_context_eval(
+            patched_model, ref, device,
+            prefix_len=int(long_cfg.get("prefix_len", 4096)),
+            pred_len=int(long_cfg.get("pred_len", 512)),
+            probe=long_cfg.get("probe", "emozilla/pg19"),
+            n_books=int(long_cfg.get("n_books", 4)),
+        )
+        if _own_base:
+            del ref
+            torch.cuda.empty_cache()
+        results["long_context"] = long_res
 
-    delta = patched_ppl - base_ppl
-    result = {
-        "base_ppl": base_ppl,
-        "patched_ppl": patched_ppl,
-        "delta_ppl": delta,  # <0 means patched is better
-    }
-    print(f"[eval] base ppl   = {base_ppl:.3f}")
-    print(f"[eval] patched ppl = {patched_ppl:.3f}")
-    print(f"[eval] delta       = {delta:+.3f}  "
-          f"({'patched BETTER' if delta < 0 else 'patched WORSE'})")
-    return result
+    return results

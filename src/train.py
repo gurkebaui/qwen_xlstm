@@ -93,8 +93,11 @@ def _open_source(src: str, split: str = "train"):
         return load_dataset("wikitext", name="wikitext-103-v1",
                            split=split, streaming=True), "text"
     if ":" in src:
-        ds_id, cfg_name = src.split(":", 1)
-        ds = load_dataset(ds_id, name=cfg_name, split=split, streaming=True)
+        ds_id, sub = src.split(":", 1)
+        # `:sub` -> datasets `data_dir=sub` (e.g. bigcode/starcoderdata:python).
+        # (We deliberately DON'T use `name=` here: starcoderdata selects its
+        #  language subset via data_dir, not config name.)
+        ds = load_dataset(ds_id, data_dir=sub, split=split, streaming=True)
     else:
         ds = load_dataset(src, split=split, streaming=True)
     # detect the text field (most of our sources use 'text')

@@ -25,6 +25,8 @@ from src.train import _open_source  # reuse the source opener
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--docs-per-source", type=int, default=2000)
+    ap.add_argument("--char-cap", type=int, default=50000,
+                   help="max chars per cached doc (bounds pg19's million-char books)")
     ap.add_argument("--out", default="data_cache/mix.jsonl")
     args = ap.parse_args()
 
@@ -53,6 +55,11 @@ def main():
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     written = 0
+    # per-source char cap: pg19 books are MILLIONS of chars (100k+ tok).
+    # We want a SAMPLE of long texts, not the entire Bible exhausting
+    # the run. Cap each doc to CHAR_CAP (~50k chars ~= 15k tok) ->
+    # still a real long-range signal, but bounded.
+    CHAR_CAP = args.char_cap
     with open(args.out, "w") as out:
         for src in srcs:
             try:
@@ -65,6 +72,8 @@ def main():
                 text = row.get(field) or ""
                 if len(text) < 64:
                     continue
+                if len(text) > CHAR_CAP:
+                    text = text[:CHAR_CAP]   # bound huge books
                 out.write(json.dumps({"text": text}) + "\n")
                 written += 1
                 n += 1
