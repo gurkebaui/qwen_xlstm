@@ -28,18 +28,24 @@ train:                                  # Stage 1 = continued pretraining (CPT)
   warmup_steps: 50
   max_steps: 2000
   per_device_batch: 1
-  grad_accum: 8
+  grad_accum: 1                          # VRAM-VERIFIED: 2048-seq x accum=2 OOMs
+                                            # on 16GB. Keep seq_len*accum <= ~4096.
   seq_len: 2048
   identity_init: true                   # zero down-proj so step0 == frozen base
+  # VRAM probe (scripts/vram_probe.py) results @ RTX4060Ti 16GB:
+  #   2048 x accum=1  -> 13.9 GB  GO   (use this)
+  #   2048 x accum=2  -> OOM
+  #   1024 x accum=8  ->  7.2 GB  GO
+  # effective batch = seq_len * per_device_batch * grad_accum
 
 data:                                   # code / math / reasoning / agentic space
-  # long-context code + math-code + some long text so memory is measurable
+  # long-context code + math-code + some long text so memory is measurable.
+  # NOTE: pg19/mathcoder streaming pragmatics TBD; we stream HF text
+  # datasets. Subset/streaming only (no full-corpus download).
   sources:
+    - "wikitext"                        # stand-in long-text (pg19 blocked, see notes #4)
     - "code:StarCoder-Data"            # long code files -> natural long-range
-    - "math:MathCoder2"                # 19.2B-tok math+code CPT corpus
-    - "text:pg19"                       # Gutenberg books, ~20x longer than WikiText
-    - "agentic:text"                    # tool-use docs / ReAct traces (L1 only)
-  eval_probe: "pg19"                    # long-range ppl = direct memory test
+  eval_probe: "wikitext"                  # long-range ppl = direct memory test
 
 eval:
   # fast, subset-only probe for the experimental stage (full suites come later)

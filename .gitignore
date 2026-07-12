@@ -24,3 +24,14 @@ runs/
 
 # --- secrets (NEVER commit) ---
 token.txt
+
+# --- conversion artifacts ---
+# converted model files
+*.onnx
+*.safetensors
+*.pt
+*.pth
+*.pkl
+
+# --- converted PDF ---
+2405.04517v2.txt

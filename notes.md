@@ -4,7 +4,66 @@
 # This file is for the NON-OBVIOUS stuff that will bite us later if we
 # forget it. Not a changelog; not the plan. Just "here's the trap and
 # how we solved it" so a future session (or Henry) doesn't re-derive it.
+#
+# ---------------------------------------------------------------------------
+# CONTENTS
+#   1. GENERATION PATH — the KV-cache + RoPE trap (FIXED, proven)
+#   2. xLSTM STATE IS RECURRENT (not parallel like attention)
+#   3. DTYPE — xLSTM layer defaults float32, Qwen loads bfloat16
+#   4. pg19 eval probe BLOCKED on datasets>=4.8 (wikitext stand-in)
+#   5. Use the REAL `xlstm` package — do NOT reimplement mLSTM
+#   6. COSMETIC / known minors (harmless, tracked so they don't surprise)
+# ---------------------------------------------------------------------------
 # =============================================================================
+
+
+## 6. COSMETIC / known minors (harmless — tracked so they don't surprise)
+------------------------------------------------------------------
+DATE: 2026-07-12   STATUS: documented, NO fix needed
+
+  (a) RMSNorm dtype warning.
+      During eval (and any forward in bf16) the base model's OWN
+      RMSNorms print:
+        UserWarning: Mismatch dtype between input and weight:
+        input dtype = c10::BFloat16, weight dtype = float, Cannot
+        dispatch to fused implementation.
+      Cause: the base Qwen layers were loaded in bf16 but their norm
+      weights present as float in that code path. OUTPUTS ARE BIT-IDENTIAL
+      (verified: identity diff = 0.0, gen match = True), so it is pure
+      noise. Left as-is rather than silently casting (a cast could mask a
+      REAL dtype bug later). Suppress only if it annoys: wrap the eval
+      forward in torch.backends.fused_layer_norm(False) or set the base
+      norms explicitly to bf16.
+
+  (b) generate() uses GREEDY argmax (no sampling/temperature).
+      tests/smoke_generate.py and the current generate() pick
+      next_tok = logits[:, -1].argmax(...). Fine for the correctness
+      smoke + a deterministic baseline, but REAL text generation will
+      want sampling / temperature / top-p. That's a thin wrapper over
+      HF's sampling — add later (don't hack it into the recurrent
+      path; keep generate() returning logits and sample at the call site).
+      NOTE: when we switch to sampling, the proof "generate matches
+      parallel forward" no longer holds (sampling is non-deterministic),
+      so keep a greedy smoke alongside any sampling change.
+
+  (c) quick_eval loads the FROZEN base a SECOND time as a separate
+      ~1GB instance to get the reference perplexity. Fine at 16GB for
+      0.5B, but doubles VRAM during eval. If we eval a bigger base
+      later, compute the reference once and reuse, or shard.
+
+  (e) TRAINING SMOKE: per-step eval re-loads the 0.5B base and STALLS on
+      this box (the 2nd from_pretrained call hangs ~indefinitely). The
+      smoke pins eval ONCE at the end (eval_every = max_steps). Real runs
+      eval every 200 steps so it's a non-issue there. If a future smoke
+      hangs again, suspect quick_eval() re-instantiating the model.
+
+  (f) CHECKPOINT SIZE: train() saves the FULL model.state_dict()
+      (frozen base + xlstm), ~1.2GB per checkpoint for 0.5B. That's
+      deliberate (lets us resume/load everything from one file), but at
+      2000 steps with periodic saves this is several GB — keep under
+      /home/henry/Documents/qwen_xlstm/checkpoints (NEVER /tmp; /tmp is
+      wiped on the idle-reboot). To shrink: save only xlstm params
+      (model.xlstm_layers.state_dict()) if base is unchanged.
 
 
 ## 1. GENERATION PATH (src/patcher.py) — the KV-cache + RoPE trap

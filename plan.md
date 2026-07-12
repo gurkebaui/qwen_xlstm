@@ -78,7 +78,34 @@ don't rediscover them mid-build.
    and (b) metric (HumanEval pass@1? perplexity vs base? downstream code gen?).
    Blocking for any run.
 
-OPEN QUESTIONS (to resolve with Henry before first run):
-  - Q8: training data + eval metric
-  - Q3/Q5: confirm LoRA-on-base + all-24 + full-train xLSTM
-  - Q1: confirm mLSTM over sLSTM
+RESOLVED Q&A (2026-07-12 — Henry)
+  Q1:  mLSTM is the way to go. sLSTM added LATER as a config option.
+  Q3/Q5: Confirmed — implement mLSTM layer first (full-train, all 24 layers).
+        LoRA is added ONLY in a later training run, not stage 1.
+  Q8:  Training mode = CONTINUED PRETRAINING (CPT), NOT from-scratch, NOT SFT.
+        Goal of stage 1: teach the mLSTM block to function on a frozen base.
+        -> AGREED: leave LoRA OUT of stage 1.
+
+DATA SPACE (reasoning + math + code + agentic; from web-search 2026-07-12)
+  - Code:          StarCoder-Data / The Stack, or SmolLM2 code mix (long files = long-range).
+  - Math+code:     MathCoder2 corpus (19.2B-tok math+code CPT set; CPT lifts math reasoning).
+  - General long:  FineWeb / Dolma; explicitly PG-19 (Gutenberg books, ~20x longer than WikiText).
+  - Agentic (L1): agentic REASONING text only (tool-use docs, ReAct/tool traces).
+                    Full multimodal trajectories (AgentTrek-style) deferred to a later stage.
+  -> Stage-1 mix should be long-context code + math-code + some long text, so the
+     memory can actually be measured. Agentic full trajectories come later.
+
+EVAL (how we know it "works")
+  - Primary:  validation loss / ppl during CPT vs a FROZEN-BASE baseline on same data.
+  - Memory probe: PG-19 perplexity — does grafted mLSTM cut long-range ppl vs base?
+                   (direct test of the "memory capability" hypothesis)
+  - Downstream (later): HumanEval / MBPP (code), GSM8K / MATH-500 (math).
+
+KEY IMPLEMENTATION GOTCHA (stage 1)
+  - mLSTM is RECURRENT (sequential, carries state across the sequence); attention is parallel.
+  - Patcher + training loop MUST carry/reset state at document boundaries (packed seqs).
+  - FIRST forward pass must NUMERICALLY EQUAL the frozen base (identity-init sanity check).
+    This is the make-or-break test before any training run.
+
+NEXT STEP: implement the mLSTM layer (smoke test: out==base at init, state carries),
+           THEN CPT run, THEN eval, THEN (later) optional LoRA + sLSTM option.
