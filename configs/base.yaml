@@ -1,0 +1,55 @@
+# =============================================================================
+# configs/base.yaml  —  single source of truth (single-field switches)
+#
+# Henry dislikes CLI-flag soup, so every knob lives here. Flip one field,
+# don't touch code. Stage-1 scope only (continued pretraining, LoRA off).
+# =============================================================================
+
+model:
+  name: "Qwen/Qwen2.5-Coder-0.5B"   # the trusty base, fully frozen
+  dtype: "bfloat16"
+  device: "cuda"
+
+xlstm:                                  # OUR inserted mLSTM sublayer config
+  embedding_dim: 896                     # MUST equal Qwen hidden (0.5B = 896)
+  num_heads: 4                          # mLSTM heads
+  context_length: 2048                  # recurrent kernel unroll length
+  proj_factor: 2.0                     # inner up-projection multiplier
+  conv1d_kernel: 4                      # causal conv kernel
+  bias: false
+  dropout: 0.0
+  variant: "mlstm"                      # mLSTM now; sLSTM = later config option
+  lora_on_base: false                   # Stage 1: NO LoRA (full-train the block)
+  insert_all_layers: true                # graft into all 24 layers
+
+train:                                  # Stage 1 = continued pretraining (CPT)
+  mode: "cpt"                           # continued-pretraining, NOT sft/from-scratch
+  learning_rate: 5.0e-4
+  warmup_steps: 50
+  max_steps: 2000
+  per_device_batch: 1
+  grad_accum: 8
+  seq_len: 2048
+  identity_init: true                   # zero down-proj so step0 == frozen base
+
+data:                                   # code / math / reasoning / agentic space
+  # long-context code + math-code + some long text so memory is measurable
+  sources:
+    - "code:StarCoder-Data"            # long code files -> natural long-range
+    - "math:MathCoder2"                # 19.2B-tok math+code CPT corpus
+    - "text:pg19"                       # Gutenberg books, ~20x longer than WikiText
+    - "agentic:text"                    # tool-use docs / ReAct traces (L1 only)
+  eval_probe: "pg19"                    # long-range ppl = direct memory test
+
+eval:
+  train_baseline_compare: true          # val loss/ppl vs frozen base on same data
+  downstream_later:                     # run AFTER stage 1, not now
+    - "HumanEval"
+    - "MBPP"
+    - "GSM8K"
+    - "MATH-500"
+
+paths:
+  checkpoints: "checkpoints/"
+  runs: "runs/"
+  results: "results/"
