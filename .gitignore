@@ -1,0 +1,23 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# --- ML artifacts (large, regenerable) ---
+checkpoints/
+wandb/
+runs/
+*.pt
+*.bin
+*.safetensors
+
+# --- Reference PDF: keep the readable .txt copy instead (smaller, diff-friendly) ---
+*.pdf
+
+# --- misc ---
+.DS_Store
+*.log
