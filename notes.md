@@ -87,13 +87,41 @@ DATE: 2026-07-12   STATUS: documented, NO fix needed
       committing to a full 2000-step run. The infrastructure (data, VRAM,
       generation, eval) all work; only the training RECIPE failed.
 
-## 9. STILL-OPEN / TODO before a meaningful training run
+  (j) RUN #2 OUTCOME (2000 steps, the FIXED recipe, 2026-07-12):
+      Config: seq_len=1024 x grad_accum=2 (eff 2048 tok/step),
+      lr=1e-4 cosine, grad_clip=1.0, gate init 0.1, AdamW.
+      Result: 0 OOMs, DONE in 986s (~16 min). Training loss dropped
+      2.4 -> ~2.0-2.7 (xlstm DID train: gate 0.10->0.078,
+      down_proj 0.00->0.0025). BUT perplexity delta vs frozen base was
+      MONOTONICALLY NEGATIVE:
+        step  20  +0.013   (warmup, ~base)
+        step 200 +0.032
+        step 600 +0.263
+        step 1000 +0.423   (worst)
+        step 2000 +0.350   (patched WORSE by +0.35 ppl)
+      So the graft learned SOMETHING (real training, not deadlocked) but it
+      made wikitext perplexity slightly WORSE. The "memory helps" hypothesis
+      is NOT supported by this run. CAVEATS (don't over-read the fail):
+        * eval is WIKITEXT ppl — a SHORT-RANGE LM probe. A recurrent
+          memory sublayer is hypothesized to help LONG-RANGE/code/structure,
+          which wikitext ppl can't show even if real. We never got CODE
+          data (StarCoder gated) or a long-range task (pg19 blocked).
+        * +0.35 ppl is SMALL (not catastrophic). Recipe is STABLE.
+        * Likely needs: better eval task (code/long-range), maybe lower LR
+          or more steps, or the gate/dim tuning. The plumbing is solid;
+          the SCIENCE question is still open.
+      Checkpoint: checkpoints/xlstm_cpt_step2000.pt (loads OK, 611.5M params).
+
+## 9. STILL-OPEN / TODO before claiming "memory helps"
 ------------------------------------------------------------------
-  * LR + grad-clip tuning for the graft (see notes #9/i).
-  * Few-step validation gate so a bad recipe dies fast (not at step 2000).
+  * BETTER EVAL: wikitext ppl is the wrong probe for a memory graft.
+    Need code perplexity (StarCoder-Data, gated -> needs HF auth) and/or
+    a long-range task (pg19 needs a parquet loader; blocked on datasets>=4.8).
+  * LR / gate / dim tuning: +0.35 ppl suggests the graft is undertrained
+    or mis-scaled for this task. Try lr=5e-5, longer runs, or a
+    learnable per-layer gate scaling.
   * Real CODE data (StarCoder-Data) is gated -> needs HF auth; currently
     using math (open-web-math) + long-text (fineweb-edu-dedup) + wikitext.
-  * pg19 long-range probe blocked on datasets>=4.8 (needs parquet loader).
   * generate() uses greedy argmax (notes 6b) - fine for now.
 
 
