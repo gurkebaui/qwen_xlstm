@@ -29,15 +29,17 @@ train:                                  # Stage 1 = continued pretraining (CPT)
   warmup_steps: 50
   max_steps: 2000
   per_device_batch: 1
-  grad_accum: 1                          # VRAM-VERIFIED: 2048-seq x accum=2 OOMs
-                                            # on 16GB. Keep seq_len*accum <= ~4096.
+  grad_accum: 2                          # accumulate 2x1024 = 2048 tokens/step.
+                                            # 2048x1 OOMs at step1 (needs 14.65GB,
+                                            # only 1.17 free). 1024x2 peak ~7-8GB SAFE.
   grad_clip: 1.0                         # clip grad norm (stability fix, notes #9/i)
   gate_steps: 20                         # validation gate: eval + abort if diverged
-  seq_len: 2048
-  identity_init: true                   # zero down-proj + gate=0 -> step0 == base
+  seq_len: 1024                         # 1024 micro-batch x accum=2 = 2048 effective
+  identity_init: true                   # zero down-proj + gate=0.1 -> step0 ~= base
   # VRAM probe (scripts/vram_probe.py) results @ RTX4060Ti 16GB:
-  #   2048 x accum=1  -> 13.9 GB  GO   (use this)
-  #   2048 x accum=2  -> OOM
+  #   2048 x accum=1  -> OOM at step1 (14.65GB needed, 1.17 free)
+  #   1024 x accum=1  -> 7.2 GB  GO
+  #   1024 x accum=2  -> ~7-8 GB  GO  (USED: 2048 tokens/step, safe)
   #   1024 x accum=8  ->  7.2 GB  GO
   # effective batch = seq_len * per_device_batch * grad_accum
 

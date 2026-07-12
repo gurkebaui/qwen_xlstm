@@ -13,9 +13,13 @@
 #     (patched vs frozen-base perplexity delta — the memory probe)
 #   * saves checkpoints to paths.checkpoints (NEVER /tmp — disk rule)
 #
-# VRAM-SAFE: config is verified by scripts/vram_probe.py
-#   (seq_len=2048, grad_accum=1, ~13.9GB on 16GB). Do NOT bump
-#   seq_len*grad_accum past ~4096 without re-running the probe.
+# VRAM-SAFE: config verified by scripts/vram_probe.py
+#   2048 x accum=1 -> OOM at step 1 (needs 14.65GB, only 1.17 free)
+#   1024 x accum=1 -> 7.2GB   (GO)
+#   1024 x accum=2 -> ~7-8GB  (GO, USED: 2048 tokens/optimizer-step)
+# Effective batch = seq_len * per_device_batch * grad_accum.
+# Do NOT set seq_len*grad_accum past ~2048 without re-running the probe
+# AND confirming peak < 14GB (the 16GB card has no real headroom).
 #
 # Run a real run:
 #     python src/train.py --config configs/base.yaml
@@ -251,25 +255,39 @@ def train(config_path: str, smoke: bool = False):
     # gate fires at gate_steps (default 20) in the real run; in smoke it's
     # effectively disabled (gate only triggers on a dedicated early eval).
     gate_steps = int(train_cfg.get("gate_steps", 20))
+    grad_accum = int(train_cfg.get("grad_accum", 1))
+    micro = 0          # micro-step counter within an accumulation cycle
+    run_loss = 0.0     # summed loss over the cycle (for logging)
     for ids in data:
         if step >= max_steps:
             break
         ids = ids.unsqueeze(0).to(device)  # (1, seq_len)
-        opt.zero_grad()
         out = model(input_ids=ids, labels=ids)
-        out.loss.backward()
-        # GRAD CLIP (stability fix, notes #9/i): a from-scratch graft in bf16
-        # can produce huge grads on step 1 -> clip to keep it bounded.
+        # scale loss by accum so the effective batch grad magnitude matches
+        # a single big batch (avoid lr effectively *accum)
+        (out.loss / grad_accum).backward()
+        run_loss += out.loss.item()
+        micro += 1
+
+        if micro < grad_accum:
+            continue  # accumulate more micro-steps before stepping
+
+        # --- end of accumulation cycle: clip + step ONCE ---
+        # GRAD CLIP (stability fix, notes #9/i): a from-scratch graft in
+        # bf16 can produce huge grads -> clip to keep it bounded.
         gclip = float(train_cfg.get("grad_clip", 1.0))
         torch.nn.utils.clip_grad_norm_(model.parameters(), gclip)
         opt.step()
         sched.step()
+        opt.zero_grad()
         step += 1
+        micro = 0
 
         if step % 1 == 0:
             lr = sched.get_last_lr()[0]
-            print(f"[train] step {step}/{max_steps}  loss={out.loss.item():.4f}  "
+            print(f"[train] step {step}/{max_steps}  loss={run_loss/grad_accum:.4f}  "
                   f"lr={lr:.2e}  ({time.time()-t0:.1f}s)")
+        run_loss = 0.0
 
         # periodic eval: patched vs frozen-base perplexity delta.
         # Also force an eval at the validation-gate step (step 20 by default)
