@@ -42,8 +42,14 @@ data:                                   # code / math / reasoning / agentic spac
   eval_probe: "pg19"                    # long-range ppl = direct memory test
 
 eval:
-  train_baseline_compare: true          # val loss/ppl vs frozen base on same data
-  downstream_later:                     # run AFTER stage 1, not now
+  # fast, subset-only probe for the experimental stage (full suites come later)
+  probe: "wikitext"       # long-text LM corpus, streams on datasets>=4.8
+                          # (pg19 is the INTENDED long-range probe but its script
+                          #  loader is dropped in datasets>=4.8; re-enable later)
+  subsample: 32            # ONLY this many docs -> quick; bump later
+  seq_len: 512            # truncate each doc to this many tokens
+  train_baseline_compare: true   # val loss/ppl vs frozen base on same data
+  downstream_later:         # run AFTER stage 1, not now
     - "HumanEval"
     - "MBPP"
     - "GSM8K"
