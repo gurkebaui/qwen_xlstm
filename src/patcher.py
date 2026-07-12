@@ -65,12 +65,15 @@ class XlstmQwenLayer(nn.Module):
         self.xlstm = xlstm
 
         # --- learnable GATE on the xlstm branch (stability fix, notes #9/i) ---
-        # m = h + gate * xlstm(norm(h)). Initialized to 0 so step-0 still equals
-        # the frozen base EXACTLY (gate=0 -> branch contributes nothing). The
-        # gate is trained FROM ZERO, so the xlstm's influence can only grow
-        # gently instead of exploding the residual stream on step 1 (which is
-        # what diverged the first run). Shape (1,) broadcasts over (B, S, D).
-        self.gate = nn.Parameter(torch.zeros(1))
+        # m = h + gate * xlstm(norm(h)). Init to a SMALL NONZERO (0.1), NOT 0.
+        # WHY NOT 0: with down_proj also zeroed (identity), gate=0 and down_proj=0
+        # both have zero gradient at step 0 (gate grad ~ xlstm_out~0; down_proj
+        # grad ~ gate*...~0) -> DEADLOCK, the xlstm never trains (confirmed:
+        # gate+down_proj stayed 0.0 after 5 steps). A small nonzero gate gives
+        # down_proj a real gradient from step 0, so the branch is trainable.
+        # Step-0 output is still ~= base because xlstm_out~0 (down_proj=0), so
+        # the identity contract holds (smoke delta=0); the gate just lets it LEARN.
+        self.gate = nn.Parameter(torch.full((1,), 0.1))
 
         # --- generation mode toggle ---
         # False (default): xLSTM runs in PARALLEL .forward()  -> training + prefill.
@@ -246,6 +249,11 @@ class XlstmQwenModel(nn.Module):
     def init_identity(self):
         for layer in self.xlstm_layers:
             layer.xlstm.init_identity()
+            # gate -> 0.1 (small nonzero, NOT 0): keeps step-0 ~= base
+            # (down_proj=0 -> xlstm_out~0) while staying TRAINABLE (gate=0
+            # would deadlock with down_proj=0, see notes #9 / gate comment).
+            with torch.no_grad():
+                layer.gate.fill_(0.1)
 
     def num_trainable_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
