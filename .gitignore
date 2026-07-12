@@ -11,6 +11,7 @@ env/
 checkpoints/
 wandb/
 runs/
+data_cache/        # pre-downloaded training data mix (scripts/cache_data.py)
 *.pt
 *.bin
 *.safetensors

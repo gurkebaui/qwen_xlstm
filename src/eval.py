@@ -141,13 +141,22 @@ def quick_eval(patched_model, cfg: Dict, device: str) -> Dict[str, float]:
     print(f"[eval] got {len(docs)} docs, computing perplexity ...")
 
     # --- frozen base (reference) ---
-    base = Qwen2ForCausalLM.from_pretrained(
-        "Qwen/Qwen2.5-Coder-0.5B", torch_dtype=torch.bfloat16
-    ).to(device)
-    base.requires_grad_(False)
-    base_ppl = _perplexity(base, docs, device, max_len=seq_len)
-    del base
-    torch.cuda.empty_cache()
+    # FIX (2026-07-12): do NOT re-instantiate the 0.5B model — the 2nd
+    # from_pretrained() STALLS on this box (see notes.md 6e). The patched
+    # model HOLDS the frozen backbone, so we evaluate that directly.
+    # It is identical to the base (backbone is frozen, untouched).
+    base_model = getattr(patched_model, "backbone", None)
+    if base_model is None:
+        # fallback: standalone model (e.g. called on a bare Qwen)
+        base = Qwen2ForCausalLM.from_pretrained(
+            "Qwen/Qwen2.5-Coder-0.5B", torch_dtype=torch.bfloat16
+        ).to(device)
+        base.requires_grad_(False)
+        base_ppl = _perplexity(base, docs, device, max_len=seq_len)
+        del base
+        torch.cuda.empty_cache()
+    else:
+        base_ppl = _perplexity(base_model, docs, device, max_len=seq_len)
 
     # --- patched model ---
     patched_ppl = _perplexity(patched_model, docs, device, max_len=seq_len)

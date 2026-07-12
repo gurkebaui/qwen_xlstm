@@ -23,10 +23,17 @@
 # =============================================================================
 
 import argparse
+import json
 import math
 import os
 import sys
 import time
+
+# FRAG-OOM FIX (2026-07-12): at seq_len=2048 the 16GB card is near the
+# VRAM limit; PyTorch's default allocator fragments and a 1.16GB contiguous
+# alloc can fail even with ~900MB free. expandable_segments lets it grow
+# segments instead of failing. Set BEFORE torch allocates anything.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -56,44 +63,109 @@ def load_config(path: str) -> dict:
         return OmegaConf.load(path)
 
 
-# --- data: stream a long-text dataset, tokenize to seq_len chunks -------
-def stream_tokens(cfg, max_docs: int = None):
-    """Yield token-id tensors of length seq_len from the configured probe.
+# --- data: stream a mix of long-text sources, tokenize to seq_len chunks -
+def _open_source(src: str, split: str = "train"):
+    """Open one configured source as a streaming HF dataset.
 
-    Streaming (no full-corpus download). `max_docs=None` = unbounded
-    stream (real run). Returns an iterator of 1D token tensors.
+    `src` may be:
+      * "wikitext"                       -> wikitext-103-v1 (special-cased)
+      * "org/dset"                       -> HF dataset, split=train, 'text' field
+      * "org/dset:config_name"           -> HF dataset with that config
+    Returns (dataset_iterator, text_field_name).
     """
     from datasets import load_dataset
+    if src == "wikitext":
+        return load_dataset("wikitext", name="wikitext-103-v1",
+                           split=split, streaming=True), "text"
+    if ":" in src:
+        ds_id, cfg_name = src.split(":", 1)
+        ds = load_dataset(ds_id, name=cfg_name, split=split, streaming=True)
+    else:
+        ds = load_dataset(src, split=split, streaming=True)
+    # detect the text field (most of our sources use 'text')
+    sample = next(iter(ds))
+    field = "text" if "text" in sample else next(
+        (k for k in sample.keys() if isinstance(sample[k], str)), "text"
+    )
+    return ds, field
+
+
+def stream_tokens(cfg, max_docs: int = None):
+    """Interleave the configured `data.sources`, yielding seq_len token chunks.
+
+    Streaming (no full-corpus download). `max_docs=None` = unbounded
+    stream (real run). Rotates through sources so the batch mix stays
+    diverse (math / long-text / baseline) across the run.
+
+    LOCAL CACHE: if data_cache/mix.jsonl exists (written by
+    scripts/cache_data.py), training reads from it instead of hitting HF
+    Hub live — so the run does NOT depend on the network staying up.
+    """
     from transformers import AutoTokenizer
 
-    probe = cfg["eval"].get("probe", "wikitext")
     seq_len = int(cfg["train"].get("seq_len", 2048))
     tok = AutoTokenizer.from_pretrained(cfg["model"]["name"])
 
-    if probe == "wikitext":
-        ds = load_dataset("wikitext", name="wikitext-103-v1",
-                         split="train", streaming=True)
-    else:
-        ds = load_dataset(probe, split="train", streaming=True)
+    cache = "data_cache/mix.jsonl"
+    if os.path.exists(cache):
+        print(f"[data] using local cache {cache} (no live HF stream)")
+        count = 0
+        buf = []
+        with open(cache) as f:
+            for line in f:
+                row = json.loads(line)
+                text = row.get("text") or ""
+                if not text or len(text) < 32:
+                    continue
+                buf.extend(tok(text).input_ids)
+                while len(buf) >= seq_len:
+                    yield torch.tensor(buf[:seq_len], dtype=torch.long)
+                    del buf[:seq_len]
+                    count += 1
+                    if max_docs is not None and count >= max_docs:
+                        return
+        if buf:
+            buf = (buf + [tok.eos_token_id] * seq_len)[:seq_len]
+            yield torch.tensor(buf, dtype=torch.long)
+        return
 
+    # --- live streaming fallback (only if no cache) ---
+    sources = cfg["data"].get("sources", ["wikitext"])
+    streams = []
+    for src in sources:
+        try:
+            ds, field = _open_source(src)
+            streams.append((ds, field, src))
+        except Exception as e:
+            print(f"[data] WARNING skipping source '{src}': {repr(e)[:120]}")
+    assert streams, "no data sources could be opened"
+
+    iters = [iter(ds) for ds, _, _ in streams]
     count = 0
     buf = []
-    for row in ds:
-        text = row.get("text") or ""
-        if not text or len(text) < 32:
-            continue
-        ids = tok(text).input_ids
-        buf.extend(ids)
-        while len(buf) >= seq_len:
-            yield torch.tensor(buf[:seq_len], dtype=torch.long)
-            del buf[:seq_len]
-        count += 1
-        if max_docs is not None and count >= max_docs:
+    while True:
+        progressed = False
+        for si, (it, field, src) in enumerate(streams):
+            try:
+                row = next(iters[si])
+            except StopIteration:
+                continue
+            progressed = True
+            text = row.get(field) or ""
+            if not text or len(text) < 32:
+                continue
+            buf.extend(tok(text).input_ids)
+            while len(buf) >= seq_len:
+                yield torch.tensor(buf[:seq_len], dtype=torch.long)
+                del buf[:seq_len]
+                count += 1
+                if max_docs is not None and count >= max_docs:
+                    return
+        if not progressed:
             break
-    if buf:  # flush remainder (pad to seq_len for a well-formed last batch)
+    if buf:
         buf = (buf + [tok.eos_token_id] * seq_len)[:seq_len]
         yield torch.tensor(buf, dtype=torch.long)
-
 
 # --- optimizer with warmup + cosine -------------------------------------
 def build_optimizer(model, lr: float, warmup: int, max_steps: int):
