@@ -202,7 +202,7 @@ def build_optimizer(model, lr: float, warmup: int, max_steps: int):
 
 
 # --- main loop ----------------------------------------------------------
-def train(config_path: str, smoke: bool = False):
+def train(config_path: str, smoke: bool = False, resume: str = None):
     cfg = load_config(config_path)
     device = cfg["model"].get("device", "cuda")
     dtype = getattr(torch, cfg["model"].get("dtype", "bfloat16"))
@@ -222,6 +222,16 @@ def train(config_path: str, smoke: bool = False):
     ).to(device)
     if train_cfg.get("identity_init", True):
         model.init_identity()
+    # RESUME: load prior weights + continue from saved step (saves
+    # re-burning already-trained steps). Optimizer/LR sched are reset
+    # (warmup restarts) — acceptable for CPT continuation.
+    start_step = 0
+    if resume:
+        ckpt = torch.load(resume, map_location="cpu", weights_only=False)
+        if "model" in ckpt:
+            model.load_state_dict(ckpt["model"])
+        start_step = int(ckpt.get("step", 0))
+        print(f"[train] RESUMED from {resume} (step {start_step})")
     model.train()
 
     n_train = model.num_trainable_params()
@@ -252,7 +262,7 @@ def train(config_path: str, smoke: bool = False):
     ckpt_dir = cfg["paths"]["checkpoints"]
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    step = 0
+    step = start_step
     t0 = time.time()
     best_delta = float("inf")   # for the validation gate
     # gate fires at gate_steps (default 20) in the real run; in smoke it's
@@ -307,23 +317,39 @@ def train(config_path: str, smoke: bool = False):
             eval_cfg["subsample"] = 4 if smoke else int(eval_cfg.get("subsample", 32))
             eval_cfg["seq_len"] = min(seq_len, 128) if smoke else int(eval_cfg.get("seq_len", 512))
             res = quick_eval(model, eval_cfg, device=device, base_model=ref_base)
-            print(f"[train]   eval delta_ppl={res['delta_ppl']:+.3f} "
-                  f"(base={res['base_ppl']:.2f} patched={res['patched_ppl']:.2f})")
+            # quick_eval returns {probe: {base_ppl, patched_ppl, delta_ppl}}
+            #   (keyed per-probe). Summarize each, pick a representative
+            #   delta for the gate (wikitext if present, else first probe).
+            for probe_name, pdict in res.items():
+                if probe_name == "long_context":
+                    continue  # long-context handled by its own print below
+                if not isinstance(pdict, dict):
+                    continue
+                print(f"[train]   eval[{probe_name}] "
+                      f"delta_ppl={pdict.get('delta_ppl', float('nan')):+.3f} "
+                      f"(base={pdict.get('base_ppl', float('nan')):.2f} "
+                      f"patched={pdict.get('patched_ppl', float('nan')):.2f})")
+            # representative delta for the validation gate
+            gate_probe = "wikitext" if "wikitext" in res else next(
+                (k for k in res if isinstance(res[k], dict)), None)
+            gate_delta = (res[gate_probe]["delta_ppl"]
+                          if gate_probe and isinstance(res.get(gate_probe), dict)
+                          else float("nan"))
 
             # --- 20-STEP VALIDATION GATE (notes #9/i) ---
             # Abort early if the recipe diverges: if at the gate the patched
             # model is WORSE than base by a lot, the recipe is bad -> stop
             # instead of burning a full run. Only in the real (non-smoke) run.
             if force_gate:
-                if res["delta_ppl"] > 5.0:   # patched >5 ppl worse than base
+                if gate_delta > 5.0:   # patched >5 ppl worse than base
                     print(f"[train] VALIDATION GATE FAILED at step {step}: "
-                          f"delta_ppl={res['delta_ppl']:.2f} (patched much worse). "
+                          f"delta_ppl={gate_delta:.2f} (patched much worse). "
                           f"Aborting — recipe diverges. Fix LR/clip/gate, don't "
                           f"waste a full run.")
                     return ckpt_dir  # no checkpoint of a diverged run
                 else:
                     print(f"[train] VALIDATION GATE PASSED at step {step}: "
-                          f"delta_ppl={res['delta_ppl']:+.2f}. Recipe stable; "
+                          f"delta_ppl={gate_delta:+.2f}. Recipe stable; "
                           f"continuing full run.")
 
     # --- checkpoint (NEVER /tmp) ---
@@ -341,6 +367,8 @@ if __name__ == "__main__":
                    help="2 steps on a tiny subset (proves the loop without a real run)")
     ap.add_argument("--max-steps", type=int, default=None,
                    help="override train.max_steps (e.g. 20 for a probe run)")
+    ap.add_argument("--resume", type=str, default=None,
+                   help="path to a checkpoint to resume from (loads weights + step)")
     args = ap.parse_args()
     if args.max_steps is not None:
         # inject override into config before train() reads it
@@ -355,4 +383,4 @@ if __name__ == "__main__":
             if yaml: yaml.safe_dump(_cfg, f)
             else: __import__("omegaconf").OmegaConf.save(_cfg, _p)
         args.config = _p
-    train(args.config, smoke=args.smoke)
+    train(args.config, smoke=args.smoke, resume=args.resume)
