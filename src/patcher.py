@@ -64,6 +64,14 @@ class XlstmQwenLayer(nn.Module):
         self.xlstm_layernorm = nn.RMSNorm(hidden, eps=1e-6)
         self.xlstm = xlstm
 
+        # --- learnable GATE on the xlstm branch (stability fix, notes #9/i) ---
+        # m = h + gate * xlstm(norm(h)). Initialized to 0 so step-0 still equals
+        # the frozen base EXACTLY (gate=0 -> branch contributes nothing). The
+        # gate is trained FROM ZERO, so the xlstm's influence can only grow
+        # gently instead of exploding the residual stream on step 1 (which is
+        # what diverged the first run). Shape (1,) broadcasts over (B, S, D).
+        self.gate = nn.Parameter(torch.zeros(1))
+
         # --- generation mode toggle ---
         # False (default): xLSTM runs in PARALLEL .forward()  -> training + prefill.
         # True (set during token-by-token decode): xLSTM runs in RECURRENT
@@ -78,7 +86,9 @@ class XlstmQwenLayer(nn.Module):
         res = hidden_states
         h = res + self.self_attn(self.input_layernorm(hidden_states), **kwargs)[0]
 
-        # NEW xlstm sublayer (trainable) — own norm + own residual
+        # NEW xlstm sublayer (trainable) — own norm + own residual.
+        # gated: m = h + gate * xlstm(norm(h)). gate starts at 0 (identity)
+        # and is trained up gently (stability fix, notes #9/i).
         if self.recurrent_mode:
             # decode step: one token, carry state
             m_xlstm, state = self.xlstm.step(
@@ -88,7 +98,7 @@ class XlstmQwenLayer(nn.Module):
         else:
             # prefill / training: whole sequence in parallel
             m_xlstm = self.xlstm(self.xlstm_layernorm(h))
-        m = h + m_xlstm
+        m = h + self.gate.to(m_xlstm.dtype) * m_xlstm
 
         # ffn sublayer (frozen)
         o = m + self.mlp(self.post_attention_layernorm(m))

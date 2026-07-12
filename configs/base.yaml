@@ -24,14 +24,17 @@ xlstm:                                  # OUR inserted mLSTM sublayer config
 
 train:                                  # Stage 1 = continued pretraining (CPT)
   mode: "cpt"                           # continued-pretraining, NOT sft/from-scratch
-  learning_rate: 5.0e-4
+  learning_rate: 1.0e-4                  # LOWERED from 5e-4: 5e-4 diverged
+                                          # the graft (first run: ppl 27->1494).
   warmup_steps: 50
   max_steps: 2000
   per_device_batch: 1
   grad_accum: 1                          # VRAM-VERIFIED: 2048-seq x accum=2 OOMs
                                             # on 16GB. Keep seq_len*accum <= ~4096.
+  grad_clip: 1.0                         # clip grad norm (stability fix, notes #9/i)
+  gate_steps: 20                         # validation gate: eval + abort if diverged
   seq_len: 2048
-  identity_init: true                   # zero down-proj so step0 == frozen base
+  identity_init: true                   # zero down-proj + gate=0 -> step0 == base
   # VRAM probe (scripts/vram_probe.py) results @ RTX4060Ti 16GB:
   #   2048 x accum=1  -> 13.9 GB  GO   (use this)
   #   2048 x accum=2  -> OOM

@@ -236,6 +236,10 @@ def train(config_path: str, smoke: bool = False):
 
     step = 0
     t0 = time.time()
+    best_delta = float("inf")   # for the validation gate
+    # gate fires at gate_steps (default 20) in the real run; in smoke it's
+    # effectively disabled (gate only triggers on a dedicated early eval).
+    gate_steps = int(train_cfg.get("gate_steps", 20))
     for ids in data:
         if step >= max_steps:
             break
@@ -243,6 +247,10 @@ def train(config_path: str, smoke: bool = False):
         opt.zero_grad()
         out = model(input_ids=ids, labels=ids)
         out.loss.backward()
+        # GRAD CLIP (stability fix, notes #9/i): a from-scratch graft in bf16
+        # can produce huge grads on step 1 -> clip to keep it bounded.
+        gclip = float(train_cfg.get("grad_clip", 1.0))
+        torch.nn.utils.clip_grad_norm_(model.parameters(), gclip)
         opt.step()
         sched.step()
         step += 1
@@ -253,10 +261,10 @@ def train(config_path: str, smoke: bool = False):
                   f"lr={lr:.2e}  ({time.time()-t0:.1f}s)")
 
         # periodic eval: patched vs frozen-base perplexity delta.
-        # Load a CLEAN fresh base ONCE (cached in `ref_base`) and reuse it
-        # across eval steps — correct reference AND avoids re-loading 0.5B
-        # every eval (which stalls on this box, notes.md #6e).
-        if step % eval_every == 0:
+        # Also force an eval at the validation-gate step (step 20 by default)
+        # so we catch divergence EARLY, before the next scheduled eval.
+        force_gate = (not smoke) and step == gate_steps
+        if step % eval_every == 0 or force_gate:
             from transformers import Qwen2ForCausalLM
             if "ref_base" not in locals():
                 ref_base = Qwen2ForCausalLM.from_pretrained(
@@ -269,6 +277,22 @@ def train(config_path: str, smoke: bool = False):
             res = quick_eval(model, eval_cfg, device=device, base_model=ref_base)
             print(f"[train]   eval delta_ppl={res['delta_ppl']:+.3f} "
                   f"(base={res['base_ppl']:.2f} patched={res['patched_ppl']:.2f})")
+
+            # --- 20-STEP VALIDATION GATE (notes #9/i) ---
+            # Abort early if the recipe diverges: if at the gate the patched
+            # model is WORSE than base by a lot, the recipe is bad -> stop
+            # instead of burning a full run. Only in the real (non-smoke) run.
+            if force_gate:
+                if res["delta_ppl"] > 5.0:   # patched >5 ppl worse than base
+                    print(f"[train] VALIDATION GATE FAILED at step {step}: "
+                          f"delta_ppl={res['delta_ppl']:.2f} (patched much worse). "
+                          f"Aborting — recipe diverges. Fix LR/clip/gate, don't "
+                          f"waste a full run.")
+                    return ckpt_dir  # no checkpoint of a diverged run
+                else:
+                    print(f"[train] VALIDATION GATE PASSED at step {step}: "
+                          f"delta_ppl={res['delta_ppl']:+.2f}. Recipe stable; "
+                          f"continuing full run.")
 
     # --- checkpoint (NEVER /tmp) ---
     ckpt_path = os.path.join(ckpt_dir, "xlstm_cpt_step%d.pt" % step)
@@ -283,5 +307,20 @@ if __name__ == "__main__":
     ap.add_argument("--config", default="configs/base.yaml")
     ap.add_argument("--smoke", action="store_true",
                    help="2 steps on a tiny subset (proves the loop without a real run)")
+    ap.add_argument("--max-steps", type=int, default=None,
+                   help="override train.max_steps (e.g. 20 for a probe run)")
     args = ap.parse_args()
+    if args.max_steps is not None:
+        # inject override into config before train() reads it
+        import yaml
+        with open(args.config) as f:
+            _cfg = yaml.safe_load(f) if yaml else __import__("omegaconf").OmegaConf.load(f)
+        _cfg["train"]["max_steps"] = args.max_steps
+        import tempfile, os
+        os.makedirs("runs", exist_ok=True)
+        _p = os.path.join("runs", "probe_cfg.yaml")  # project dir, not /tmp
+        with open(_p, "w") as f:
+            if yaml: yaml.safe_dump(_cfg, f)
+            else: __import__("omegaconf").OmegaConf.save(_cfg, _p)
+        args.config = _p
     train(args.config, smoke=args.smoke)
