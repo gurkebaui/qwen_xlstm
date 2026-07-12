@@ -64,28 +64,37 @@ class XlstmQwenLayer(nn.Module):
         self.xlstm_layernorm = nn.RMSNorm(hidden, eps=1e-6)
         self.xlstm = xlstm
 
-    # ---- training forward (parallel; state not needed) ----
+        # --- generation mode toggle ---
+        # False (default): xLSTM runs in PARALLEL .forward()  -> training + prefill.
+        # True (set during token-by-token decode): xLSTM runs in RECURRENT
+        # .step() and carries state across tokens (the memory). We store the
+        # carried state on the layer so the caller can read it back.
+        self.recurrent_mode = False
+        self._last_xlstm_state = None
+
+    # ---- training / prefill forward (parallel; state not needed) ----
     def forward(self, hidden_states, **kwargs):
         # attention sublayer (frozen) — Qwen's own residual
         res = hidden_states
         h = res + self.self_attn(self.input_layernorm(hidden_states), **kwargs)[0]
 
         # NEW xlstm sublayer (trainable) — own norm + own residual
-        m = h + self.xlstm(self.xlstm_layernorm(h))
+        if self.recurrent_mode:
+            # decode step: one token, carry state
+            m_xlstm, state = self.xlstm.step(
+                self.xlstm_layernorm(h), state=self._last_xlstm_state
+            )
+            self._last_xlstm_state = state
+        else:
+            # prefill / training: whole sequence in parallel
+            m_xlstm = self.xlstm(self.xlstm_layernorm(h))
+        m = h + m_xlstm
 
         # ffn sublayer (frozen)
         o = m + self.mlp(self.post_attention_layernorm(m))
         return o
 
-    # ---- generation step (recurrent; state carried) ----
-    def step(self, hidden_states, state: Optional[dict] = None, **kwargs):
-        res = hidden_states
-        # attn is causal+KV-cached by HF; for a single token we call it directly
-        h = res + self.self_attn(self.input_layernorm(hidden_states), **kwargs)[0]
-        m, xlstm_state = self.xlstm.step(self.xlstm_layernorm(h), state=state)
-        m = h + m
-        o = m + self.mlp(self.post_attention_layernorm(m))
-        return o, {"xlstm_state": xlstm_state}
+    # ---- generation: caller drives recurrent_mode; see XlstmQwenModel.generate_step ----
 
 
 class XlstmQwenModel(nn.Module):
@@ -141,22 +150,83 @@ class XlstmQwenModel(nn.Module):
         )
 
     # ---------------------------------------------------------------- #
-    # GENERATION step: one token at a time, recurrent state carried.       #
-    # `layer_states[i]` is the xlstm state for layer i. Caller resets it   #
-    # to None at the start of each new sequence.                         #
+    # GENERATION: prefill in parallel, then decode token-by-token.           #
+    #                                                                     #
+    # We do NOT reimplement the decoder walk. Instead we let HuggingFace's   #
+    # own forward do attention + RoPE + KV-cache correctly (that's exactly #
+    # what crashed before: calling Qwen attention raw lost those). We only   #
+    # flip the xLSTM sublayers into RECURRENT mode so THEY carry memory.    #
+    #                                                                     #
+    # Two things must be carried between steps (this is the part that was    #
+    # previously broken):                                                       #
+    #   * HF's past_key_values (the KV cache) -> attention sees the full   #
+    #     prefix without recomputing it (O(n) decode, correct RoPE).       #
+    #   * the xLSTM recurrent state (matrix memory + conv) -> our memory.   #
+    # `generate_step` threads BOTH. `generate()` orchestrates the loop.      #
     # ---------------------------------------------------------------- #
-    def generate_step(self, input_ids, layer_states: Optional[Dict[int, dict]] = None, **kwargs):
+    @torch.no_grad()
+    def generate_step(self, input_ids, layer_states=None, past_key_values=None,
+                    **kwargs):
         if layer_states is None:
             layer_states = {i: None for i in range(len(self.xlstm_layers))}
-        # run the backbone layers manually so we can thread state through xlstm
-        x = self.backbone.model.embed_tokens(input_ids)
-        for i, layer in enumerate(self.backbone.model.layers):
-            st = layer_states.get(i)
-            x, new_st = layer.step(x, state=st, **kwargs)
-            layer_states[i] = new_st
-        x = self.backbone.model.norm(x)
-        logits = self.backbone.lm_head(x)
-        return logits, layer_states
+        # put xlstm layers into recurrent mode (state carried across tokens).
+        # each layer holds its own carried state in _last_xlstm_state;
+        # we harvest it back into layer_states[i] after the forward.
+        for layer in self.xlstm_layers:
+            layer.recurrent_mode = True
+            layer._last_xlstm_state = None
+
+        out = self.backbone(
+            input_ids=input_ids,
+            use_cache=True,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+        logits = out.logits
+        pkv = out.past_key_values  # carry the KV cache forward
+
+        # harvest the carried xlstm states back into the caller dict
+        for i, layer in enumerate(self.xlstm_layers):
+            layer_states[i] = layer._last_xlstm_state
+        return logits, layer_states, pkv
+
+    @torch.no_grad()
+    def generate(self, prompt_ids: torch.Tensor, max_new_tokens: int = 8):
+        """Autoregressive generate. Returns the full token ids (prompt + new).
+
+        Correctness: prefill builds the KV cache + xlstm states from the
+        whole prompt; each decode step feeds ONLY the last token back, carrying
+        BOTH HF's past_key_values and the xlstm recurrent state.
+        """
+        self.reset_generation()
+        ids = prompt_ids.to(self.device)
+
+        # --- prefill: parallel forward over the full prompt ---
+        layer_states = {i: None for i in range(len(self.xlstm_layers))}
+        pkv = None
+        # prefill uses parallel xlstm (recurrent_mode False) via normal forward
+        out = self.backbone(input_ids=ids, use_cache=True)
+        pkv = out.past_key_values
+        # initialize xlstm states to None for the upcoming decode steps
+        for layer in self.xlstm_layers:
+            layer._last_xlstm_state = None
+
+        # --- decode loop: one new token at a time ---
+        for _ in range(max_new_tokens):
+            last = ids[:, -1:]
+            logits, layer_states, pkv = self.generate_step(
+                last, layer_states=layer_states, past_key_values=pkv
+            )
+            next_tok = logits[:, -1].argmax(dim=-1, keepdim=True)
+            ids = torch.cat([ids, next_tok], dim=1)
+        self.reset_generation()
+        return ids
+
+    def reset_generation(self):
+        """Clear recurrent state + recurrent_mode for a fresh sequence."""
+        for layer in self.xlstm_layers:
+            layer.recurrent_mode = False
+            layer._last_xlstm_state = None
 
     # ---------------------------------------------------------------- #
     # IDENTITY init: zero every xlstm down-proj so the inserted branch     #
