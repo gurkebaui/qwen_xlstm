@@ -27,7 +27,7 @@ train:                                  # Stage 1 = continued pretraining (CPT)
   learning_rate: 1.0e-4                  # LOWERED from 5e-4: 5e-4 diverged
                                           # the graft (first run: ppl 27->1494).
   warmup_steps: 50
-  max_steps: 2000
+  max_steps: 10000                      # overnight: ~50-90min @ ~0.5-0.9s/step
   per_device_batch: 1
   grad_accum: 2                          # accumulate 2x1024 = 2048 tokens/step.
                                             # 2048x1 OOMs at step1 (needs 14.65GB,

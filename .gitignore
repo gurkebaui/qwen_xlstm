@@ -15,9 +15,12 @@ data_cache/        # pre-downloaded training data mix (scripts/cache_data.py)
 *.pt
 *.bin
 *.safetensors
+*.pth
+*.pkl
+*.onnx
 
-# --- Reference PDF: keep the readable .txt copy instead (smaller, diff-friendly) ---
-*.pdf
+# --- Reference paper (NEVER commit; recovered ArXiv 2405.04517) ---
+papers/
 
 # --- misc ---
 .DS_Store
@@ -25,14 +28,3 @@ data_cache/        # pre-downloaded training data mix (scripts/cache_data.py)
 
 # --- secrets (NEVER commit) ---
 token.txt
-
-# --- conversion artifacts ---
-# converted model files
-*.onnx
-*.safetensors
-*.pt
-*.pth
-*.pkl
-
-# --- converted PDF ---
-2405.04517v2.txt

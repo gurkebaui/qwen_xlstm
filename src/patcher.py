@@ -179,21 +179,28 @@ class XlstmQwenModel(nn.Module):
     # ---------------------------------------------------------------- #
     @torch.no_grad()
     def generate_step(self, input_ids, layer_states=None, past_key_values=None,
-                    **kwargs):
+                     position_ids=None, **kwargs):
         if layer_states is None:
             layer_states = {i: None for i in range(len(self.xlstm_layers))}
-        # put xlstm layers into recurrent mode (state carried across tokens).
-        # each layer holds its own carried state in _last_xlstm_state;
-        # we harvest it back into layer_states[i] after the forward.
-        for layer in self.xlstm_layers:
+        # put xlstm layers into recurrent mode AND carry the harvested state
+        # across steps. (BUG FIX: an earlier version reset
+        # `_last_xlstm_state = None` here on EVERY call, which discarded
+        # the memory between tokens -> the xlstm only saw one token at a
+        # time and carried NOTHING. That made the recurrent path a no-op
+        # and the earlier "generate MATCH" smoke test meaningless. Now we
+        # feed the previous step's state back in, so memory accumulates
+        # across the whole sequence -- THIS is what the long-context
+        # memory probe measures.)
+        for i, layer in enumerate(self.xlstm_layers):
             layer.recurrent_mode = True
-            layer._last_xlstm_state = None
+            layer._last_xlstm_state = layer_states[i]   # carry, don't reset
 
         out = self.backbone(
             input_ids=input_ids,
             use_cache=True,
             past_key_values=past_key_values,
-            **kwargs,
+            position_ids=position_ids,   # CRITICAL: keeps RoPE correct
+            **kwargs,                            # across token-by-token decode
         )
         logits = out.logits
         pkv = out.past_key_values  # carry the KV cache forward

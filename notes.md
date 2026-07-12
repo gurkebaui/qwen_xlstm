@@ -211,14 +211,90 @@ DATE: 2026-07-12   STATUS: workaround in place (wikitext stand-in)
   parquet) so we get the stronger long-range signal.
 
 
-## 5. We use the REAL `xlstm` package — do NOT reimplement mLSTM
+## 10. NIGHT SESSION (2026-07-13): paper, eval, recurrent bug
 ------------------------------------------------------------------
-DATE: 2026-07-12   STATUS: enforced by design
+DATE: 2026-07-13   STATUS: eval done (parallel), recurrent decode BROKEN
 
-  src/xlstm_layer.py wraps `xlstm.blocks.mlstm.layer.mLSTMLayer`
-  (xlstm 2.0.5 + mlstm_kernels 2.0.2, both pip-installed).
-  If a future session is tempted to "just write the mLSTM cell", DON'T —
-  the official package is the source of truth and already has the parallel
-  + recurrent (state-carry) kernels. Inspect the installed source under
-  /home/henry/miniconda3/lib/python3.13/site-packages/xlstm/ before
-  touching anything mLSTM-related.
+### (a) Paper recovered + gitignored
+  `papers/xlstm_paper.pdf` (ArXiv 2405.04517, Beck et al.) was
+  still in repo root (a `git pull` hadn't deleted it). Recovered a
+  readable txt via PyMuPDF -> `papers/xlstm_paper_readable.txt`.
+  CONFIRMED the claim Henry remembered (Section "Sequence Length
+  Extrapolation"): xLSTM TRAINED at context 2048 was TESTED at
+  16384 and "maintain low perplexities for longer contexts" — i.e. it
+  extrapolates ~8x with CONSTANT memory (recurrence is O(1)-state,
+  not O(S^2) like attention). This is the license for training
+  at small ctx and expecting it to work long.
+  gitignore: added a `papers/` rule (PDF + txt are reference
+  artifacts, NEVER commit). token.txt still gitignored.
+
+### (b) RECURRENT STATE-CARRY BUG (FIXED — was silently killing memory)
+  `XlstmQwenLayer.generate_step` RESET `_last_xlstm_state = None`
+  on EVERY call. So the xlstm state was discarded between tokens
+  -> it only ever saw ONE token at a time -> carried NOTHING. The
+  earlier "smoke_generate MATCH True" was misleading: with state
+  reset, the xlstm was a no-op, so patched == base by construction.
+  FIX: feed `layer_states[i]` back in each step (carry, don't reset).
+  Now memory accumulates across the sequence — THIS is what the
+  long-context probe measures.
+
+### (c) Variable-context eval (the "find the mLSTM limit" probe)
+  New `variable_context_eval` in src/eval.py. Method matches the
+  paper's OWN extrapolation test (Fig 7): PARALLEL forward at
+  increasing prefix length L, measure next-token ppl on the
+  following eval_len tokens, for BOTH base and patched.
+  WHY parallel (not the .step() recurrent walk): walking
+  token-by-token through our swapped decoder layers hits a
+  transformers-5.5 RoPE/`position_embeddings` bug (see (d)) —
+  and the paper itself uses parallel forward for this eval anyway.
+  GOTCHA: the mLSTM's `causal_mask` is a FIXED buffer sized
+  `context_length**2`, created at __init__. To eval at L you must
+  build the eval model with `context_length >= L + eval_len` or you
+  get a mask/sequence size mismatch. (And a 16384**2 mask parallel
+  forward OOMs at 16GB — see (e).)
+
+  RESULTS on saved step2000 ckpt (verified, not guessed):
+    L=1024: base 4.60  patch 4.65  delta +0.05
+    L=2048: base 10.78 patch 10.92 delta +0.15
+    L=4096: base 11.50 patch 11.67 delta +0.17
+  => graft is STABLE at 2x trained context (delta does NOT
+  explode) but still slightly WORSE than base. Not helpful yet,
+  not broken. Henry's prediction holds: "slight decrease is okay
+  until we fine-tune it to use the mLSTM."
+
+### (d) RECURRENT DECODE RoPE BUG (OPEN — blocks generation + recurrent training/eval)
+  `backbone(input_ids=last_token, past_key_values=..., position_ids=...)`
+  through our swapped `XlstmQwenLayer` raises inside Qwen
+  attention `apply_rotary_pos_emb`: "size of tensor a (14) must
+  match tensor b (64) at dim 3". Root: HF transformers 5.5
+  `Qwen2Attention.forward` expects `position_embeddings` (cos/sin
+  tuple) as a positional arg COMPUTED by the model's TOP-LEVEL
+  forward and passed DOWN to attention. We REPLACED the decoder
+  layer, so that computation is skipped, and passing `position_ids`
+  via **kwargs doesn't reconstruct it. Token-by-token decode (the
+  .step() path) needs this; parallel forward (top-level) is fine.
+  IMPACT: `generate()` + recurrent long-context training + the
+  recurrent-mode eval are ALL blocked. Paper's 2048->16384 claim
+  can only be truly tested once this is fixed (or on a bigger GPU
+  with parallel eval capped lower).
+  FIX PATH (not yet done): either (i) compute cos/sin in
+  `XlstmQwenLayer.forward` and pass `position_embeddings` to
+  `self.self_attn`, or (ii) stop replacing the layer and
+  monkey-patch its forward instead. Highest-value fix remaining.
+
+### (e) VRAM wall on long parallel eval
+  Parallel forward at L needs the mLSTM mask L**2. At 16GB:
+    ~4096**2 mask + activations fits (~7-12GB).
+    16384**2 mask alone ~1GB but full fwd OOMs (138MB mask alloc
+    error seen). So the variable eval is capped at L<=~4096 here.
+  The recurrence is SUPPOSED to beat this (constant state) — but
+  that needs (d) fixed first.
+
+### (f) Fine-tuning plan written
+  `docs/finetune_plan.md` — Stage 1 (CPT, this run) -> Stage 2
+  (SFT, unfreeze all, code+reason+agentic+long-text data from
+  ToolBench/AgentInstruct/PG19-QA) -> Stage 3 (GRPO RL,
+  outcome rewards). Library call: TRL SFTTrainer accepts nn.Module
+  (OK for us); GRPOTrainer needs PreTrainedModel -> we must wrap
+  XlstmQwenModel as one, or self-implement GRPO. The part libs
+  can't touch (our recurrent mLSTM decode) we do ourselves.

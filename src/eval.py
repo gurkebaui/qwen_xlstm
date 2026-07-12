@@ -183,12 +183,106 @@ def long_context_eval(patched_model, base_model, device: str,
         "delta": float(torch.exp(torch.tensor(lp)).item()
                    - torch.exp(torch.tensor(lb)).item()),
     }
-    print(f"[long] prefix={prefix_len} tok, {books} books: "
-          f"base_ppl={res['prefix_ppl_base']:.2f} "
-          f"patch={res['prefix_ppl_patch']:.2f} "
-          f"delta={res['delta']:+.2f} "
-          f"({'patch BETTER' if res['delta'] < 0 else 'patch WORSE'})")
-    return res
+# --- VARIABLE-CONTEXT probe (find the mLSTM limit) ----------------
+# Method matches the xLSTM paper's own extrapolation test (Fig 7:
+# "trained at 2048, tested at 16384"): PARALLEL forward at
+# increasing context length. The paper does NOT use recurrent decode
+# for this eval -- it feeds the long prefix in parallel and measures
+# next-token ppl. So we build the eval model with a LARGE
+# context_length (so the mLSTM's internal causal-mask buffer fits
+# the longest L) and run parallel .forward at each L.
+#
+# WHY this over the .step() recurrent walk: walking token-by-token
+# through HF's attention with swapped decoder layers hits a
+# transformers-5.5 RoPE/position_embeddings bug (the model's
+# top-level forward normally pre-computes cos/sin and passes them
+# DOWN to attention; our custom layer skips that). Parallel forward
+# is bug-free AND is what the paper actually does. (Recurrent
+# .step() decode is still the right path for GENERATION; that's a
+# separate, deferred fix -- noted in notes.md.)
+@torch.no_grad()
+def variable_context_eval(patched_model, base_model, device: str,
+                         lengths=(2048, 4096, 8192, 16384),
+                         eval_len: int = 256, probe: str = "emozilla/pg19",
+                         n_books: int = 3, max_scanned: int = 300):
+    """Measure next-token ppl at increasing prefix lengths L.
+
+    For each L: take a pg19 book, tokenize to L+eval_len, run a
+    SINGLE parallel forward over the whole (prefix+post) for BOTH
+    base and patched, and measure ppl on the post-L tokens only.
+
+    * Base (frozen Qwen, native 32k): ppl should HOLD or only
+      mildly degrade as L grows (attention sees all L tokens).
+    * Patched (mLSTM graft, built with context_length>=max L):
+      if the graft's memory generalizes like the paper says, patched
+      ppl should stay flat (or beat base) as L -> 16384. If it
+      explodes, that's the mLSTM's effective limit.
+
+    Returns: {L: {base_ppl, patch_ppl, delta}}.
+    """
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-0.5B")
+
+    max_L = max(lengths)
+    need_chars = (max_L + eval_len) * 2
+
+    ds = load_dataset(probe, split="train", streaming=True)
+    it = iter(ds)
+    books_text = []
+    scanned = 0
+    while len(books_text) < n_books and scanned < max_scanned:
+        scanned += 1
+        row = next(it, None)
+        if row is None:
+            break
+        text = row.get("text") or ""
+        if len(text) < need_chars:
+            continue
+        books_text.append(text)
+
+    if not books_text:
+        print(f"[vctx] FOUND 0 books >= {need_chars} chars after "
+              f"{max_scanned} scanned -> cannot run")
+        return {}
+
+    ce = torch.nn.functional.cross_entropy
+    out = {}
+    for L in lengths:
+        pl_base, pl_patch, tk = 0.0, 0.0, 0
+        ok = 0
+        for text in books_text:
+            ids = tok(text, return_tensors="pt", truncation=True,
+                      max_length=L + eval_len).input_ids[0].to(device)
+            if ids.numel() < L + eval_len:
+                continue
+            pre, post = ids[:L], ids[L:L + eval_len]
+            full = torch.cat([pre, post]).unsqueeze(0)
+
+            # HF logits[i] predict token i+1, so to predict post
+            # (= full[L : L+eval_len]) we use logits at L-1 : L-1+eval_len.
+            b_out = base_model(input_ids=full, use_cache=False)
+            b_l = ce(b_out.logits[0, L - 1 : L - 1 + eval_len].float(),
+                     post, reduction="sum").item()
+            pl_base += b_l
+
+            p_out = patched_model(input_ids=full, use_cache=False)
+            p_l = ce(p_out.logits[0, L - 1 : L - 1 + eval_len].float(),
+                     post, reduction="sum").item()
+            pl_patch += p_l
+            tk += post.numel()
+            ok += 1
+
+        if tk == 0:
+            print(f"[vctx] L={L}: no usable books, skip")
+            continue
+        rb = float(torch.exp(torch.tensor(pl_base / tk)).item())
+        rp = float(torch.exp(torch.tensor(pl_patch / tk)).item())
+        out[L] = {"base_ppl": rb, "patch_ppl": rp, "delta": rp - rb}
+        print(f"[vctx] L={L:6d} books={ok}: base_ppl={rb:.2f} "
+              f"patch_ppl={rp:.2f} delta={rp - rb:+.2f} "
+              f"({'patch BETTER' if rp < rb else 'patch WORSE'})")
+    return out
 
 
 # --- public entry ---------------------------------------------------------
