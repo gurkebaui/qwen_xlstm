@@ -22,6 +22,17 @@
 # Smoke (2 steps, tiny subset) — see tests/smoke_train.py
 # =============================================================================
 
+# FRAG-OOM FIX (2026-07-12): at seq_len=2048 the 16GB card is near the
+# VRAM limit; PyTorch's default allocator fragments and a 1.16GB chunk fails
+# with ~1.17GB "free" (it can't find a contiguous block). expandable_segments
+# lets it reuse freed segments. MUST be set BEFORE torch/CUDA initializes.
+# Previously set only as a shell env var (PYTORCH_CUDA_ALLOC_CONF=...) but
+# the conda/shell wrapper STRIPPED it -> the real run OOM'd at step 1 with
+# PyTorch's own "try setting expandable_segments" hint. Setting it HERE in
+# Python is bulletproof (can't be stripped).
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import json
 import math
