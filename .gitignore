@@ -21,3 +21,6 @@ runs/
 # --- misc ---
 .DS_Store
 *.log
+
+# --- secrets (NEVER commit) ---
+token.txt
