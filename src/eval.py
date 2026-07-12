@@ -94,10 +94,15 @@ def _load_text_docs(probe: str, subsample: int, seq_len: int,
 @torch.no_grad()
 def _perplexity(model, doc_ids: List[torch.Tensor], device: str,
                 max_len: int) -> float:
-    """Mean perplexity over docs. ppl = exp(mean token loss).
+    """Perplexity = exp(mean token loss) over the eval docs.
 
-    We feed each doc in chunks of `max_len` (handling long docs) and average
-    the losses weighted by token count. Labels are shifted internally by HF.
+    CORRECT aggregation: run each doc once (docs are already <= max_len),
+    take HF's mean-CE loss for that doc, then weight across docs by token
+    count. This matches the standard "concatenate valid tokens" ppl.
+
+    (Earlier version chunked docs at max_len AND re-weighted, which
+    over-estimated ppl ~2x — see notes.md #8. Now: one forward per doc,
+    token-weighted mean loss. No double counting.)
     """
     model.eval()
     total_loss = 0.0
@@ -105,20 +110,13 @@ def _perplexity(model, doc_ids: List[torch.Tensor], device: str,
     for ids in doc_ids:
         ids = ids.to(device)
         n = ids.numel()
-        # chunk to avoid OOM on very long docs; sum losses weighted by tokens
-        seg_loss = 0.0
-        seg_tok = 0
-        for s in range(0, n, max_len):
-            chunk = ids[s:s + max_len].unsqueeze(0)  # (1, L)
-            if chunk.numel() < 2:
-                continue
-            out = model(input_ids=chunk, labels=chunk)
-            # HF returns loss averaged over the chunk's tokens
-            seg_loss += out.loss.item() * (chunk.numel() - 1)
-            seg_tok += (chunk.numel() - 1)
-        if seg_tok > 0:
-            total_loss += seg_loss
-            total_tokens += seg_tok
+        if n < 2:
+            continue
+        chunk = ids.unsqueeze(0)  # (1, n)  — doc already <= max_len
+        out = model(input_ids=chunk, labels=chunk)
+        # HF returns loss = MEAN CE over the doc's n-1 shifted targets
+        total_loss += out.loss.item() * (n - 1)
+        total_tokens += (n - 1)
     if total_tokens == 0:
         return float("nan")
     mean_loss = total_loss / total_tokens
@@ -126,7 +124,8 @@ def _perplexity(model, doc_ids: List[torch.Tensor], device: str,
 
 
 # --- public entry ---------------------------------------------------------
-def quick_eval(patched_model, cfg: Dict, device: str) -> Dict[str, float]:
+def quick_eval(patched_model, cfg: Dict, device: str,
+               base_model=None) -> Dict[str, float]:
     """Run the quick subset eval. Compares patched vs frozen base.
 
     `cfg` is the eval section of base.yaml (dict). Returns a dict of ppl
@@ -140,23 +139,25 @@ def quick_eval(patched_model, cfg: Dict, device: str) -> Dict[str, float]:
     docs = _load_text_docs(probe=probe, subsample=subsample, seq_len=seq_len)
     print(f"[eval] got {len(docs)} docs, computing perplexity ...")
 
-    # --- frozen base (reference) ---
-    # FIX (2026-07-12): do NOT re-instantiate the 0.5B model — the 2nd
-    # from_pretrained() STALLS on this box (see notes.md 6e). The patched
-    # model HOLDS the frozen backbone, so we evaluate that directly.
-    # It is identical to the base (backbone is frozen, untouched).
-    base_model = getattr(patched_model, "backbone", None)
+    # --- frozen base (reference) = a CLEAN, separately-loaded Qwen ---
+    # CRITICAL: do NOT use patched_model.backbone here. During construction
+    # we swap the backbone's layers IN-PLACE for XlstmQwenLayer, so
+    # patched_model.backbone IS the patched model, not a clean base. Using it
+    # would make base==patched and always report delta=0 (this bug burned a
+    # full 2000-step run's eval — see notes.md #8). Load a real fresh base.
     if base_model is None:
-        # fallback: standalone model (e.g. called on a bare Qwen)
-        base = Qwen2ForCausalLM.from_pretrained(
+        base_model = Qwen2ForCausalLM.from_pretrained(
             "Qwen/Qwen2.5-Coder-0.5B", torch_dtype=torch.bfloat16
         ).to(device)
-        base.requires_grad_(False)
-        base_ppl = _perplexity(base, docs, device, max_len=seq_len)
-        del base
-        torch.cuda.empty_cache()
+        base_model.requires_grad_(False)
+        _own_base = True
     else:
-        base_ppl = _perplexity(base_model, docs, device, max_len=seq_len)
+        _own_base = False
+
+    base_ppl = _perplexity(base_model, docs, device, max_len=seq_len)
+    if _own_base:
+        del base_model
+        torch.cuda.empty_cache()
 
     # --- patched model ---
     patched_ppl = _perplexity(patched_model, docs, device, max_len=seq_len)

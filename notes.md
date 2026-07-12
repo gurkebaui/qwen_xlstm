@@ -57,13 +57,44 @@ DATE: 2026-07-12   STATUS: documented, NO fix needed
       eval every 200 steps so it's a non-issue there. If a future smoke
       hangs again, suspect quick_eval() re-instantiating the model.
 
-  (f) CHECKPOINT SIZE: train() saves the FULL model.state_dict()
+  (g) CHECKPOINT SIZE: train() saves the FULL model.state_dict()
       (frozen base + xlstm), ~1.2GB per checkpoint for 0.5B. That's
       deliberate (lets us resume/load everything from one file), but at
       2000 steps with periodic saves this is several GB — keep under
       /home/henry/Documents/qwen_xlstm/checkpoints (NEVER /tmp; /tmp is
       wiped on the idle-reboot). To shrink: save only xlstm params
       (model.xlstm_layers.state_dict()) if base is unchanged.
+
+  (h) EVAL BUG (burned the first 2000-step run's eval): quick_eval used
+      patched_model.backbone as the "base" reference. But we swap
+      backbone.model.layers IN-PLACE for XlstmQwenLayer during construction,
+      so patched_model.backbone IS the patched model -> base==patched ->
+      delta ALWAYS 0.0 (false "no change"). FIXED 2026-07-12: quick_eval
+      now loads a SEPARATE fresh Qwen2ForCausalLM as the reference (cached
+      per run). After the fix, the real eval on xlstm_cpt_step2000.pt showed
+      base=27.5, patched=1494.8 -> the graft made ppl ~54x WORSE (see #9).
+      NEVER pass patched_model.backbone as a base reference again.
+
+  (i) TRAINING DIVERGENCE (the first real run FAILED): after 2000 steps at
+      lr=5e-4 (cosine->0) the graft's ppl went 27.5 -> 1494.8. The training
+      loss oscillated 1.1-8.0 the whole run = unstable, not converging.
+      Root cause: LR too high + no grad clip for a from-scratch mLSTM graft
+      in bf16; the xlstm output overshot and wrecked the residual stream.
+      FIX BEFORE NEXT RUN: lower lr (1e-4 or 5e-5), add grad clipping
+      (clip_grad_norm 1.0), consider a learnable scalar gate on the xlstm
+      branch so it starts near-zero and grows slowly. ALSO: add a
+      few-step validation gate (eval delta stays ~0 or improves) BEFORE
+      committing to a full 2000-step run. The infrastructure (data, VRAM,
+      generation, eval) all work; only the training RECIPE failed.
+
+## 9. STILL-OPEN / TODO before a meaningful training run
+------------------------------------------------------------------
+  * LR + grad-clip tuning for the graft (see notes #9/i).
+  * Few-step validation gate so a bad recipe dies fast (not at step 2000).
+  * Real CODE data (StarCoder-Data) is gated -> needs HF auth; currently
+    using math (open-web-math) + long-text (fineweb-edu-dedup) + wikitext.
+  * pg19 long-range probe blocked on datasets>=4.8 (needs parquet loader).
+  * generate() uses greedy argmax (notes 6b) - fine for now.
 
 
 ## 1. GENERATION PATH (src/patcher.py) — the KV-cache + RoPE trap

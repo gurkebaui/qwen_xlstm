@@ -252,12 +252,21 @@ def train(config_path: str, smoke: bool = False):
             print(f"[train] step {step}/{max_steps}  loss={out.loss.item():.4f}  "
                   f"lr={lr:.2e}  ({time.time()-t0:.1f}s)")
 
-        # periodic eval: patched vs frozen-base perplexity delta
+        # periodic eval: patched vs frozen-base perplexity delta.
+        # Load a CLEAN fresh base ONCE (cached in `ref_base`) and reuse it
+        # across eval steps — correct reference AND avoids re-loading 0.5B
+        # every eval (which stalls on this box, notes.md #6e).
         if step % eval_every == 0:
+            from transformers import Qwen2ForCausalLM
+            if "ref_base" not in locals():
+                ref_base = Qwen2ForCausalLM.from_pretrained(
+                    cfg["model"]["name"], torch_dtype=dtype
+                ).to(device)
+                ref_base.requires_grad_(False)
             eval_cfg = dict(cfg["eval"])
             eval_cfg["subsample"] = 4 if smoke else int(eval_cfg.get("subsample", 32))
             eval_cfg["seq_len"] = min(seq_len, 128) if smoke else int(eval_cfg.get("seq_len", 512))
-            res = quick_eval(model, eval_cfg, device=device)
+            res = quick_eval(model, eval_cfg, device=device, base_model=ref_base)
             print(f"[train]   eval delta_ppl={res['delta_ppl']:+.3f} "
                   f"(base={res['base_ppl']:.2f} patched={res['patched_ppl']:.2f})")
 
