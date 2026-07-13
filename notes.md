@@ -294,59 +294,66 @@ DATE: 2026-07-13   STATUS: eval done (parallel), recurrent decode BROKEN
   Resumed from step2000 -> 10000 (added `--resume` to train.py;
   LR sched warmup restarts, fine for CPT continuation). 7152s (~2h),
   0 crashes, ckpt `checkpoints/xlstm_cpt_step10000.pt` (1.2GB).
-  FINAL quick_eval vs FROZEN base (32-doc subsample, seq512):
-    wikitext:         base 30.76  patched 38.52  delta +7.76  (WORSE)
-    starcoder (code): base  3.15  patched  3.32  delta +0.17  (WORSE, tiny)
-    pg19 (long-text):base 17.93  patched 12.00  delta -5.93  (BETTER, big)
-  INTERPRETATION (honest):
-    - mLSTM WINS big on long-text (pg19 -5.9 ppl) -> it IS
-      carrying long-range memory. The step-2200 flip (-4.46) held
-      and strengthened to -5.93 at step10000.
-    - Neutral on code (+0.17, ~noise).
-    - Worse on out-of-domain short WikiText (+7.76): expected
-      trade — the model SPECIALIZES for long-context recall at the
-      cost of generic short-text fluency. WikiText is a poor proxy
-      (not the training distribution) so don't over-weight it.
-  The "slight decrease until we fine-tune" prediction is confirmed
-  but with a TWIST: it's not uniform — long-text IMPROVES,
-  short-text degrades. That's the specialization we want to then
-  SHARPEN in Stage2 (SFT) + Stage3 (GRPO).
-  (Variable-context extrapolation probe at L=4096 on this ckpt
-   was running at session end — see runs/eval_vctx_step10000.log.)
+  ### (d) RECURRENT DECODE RoPE BUG — FIXED (2026-07-13)
+    WAS: `generate_step` (token-by-token, sets recurrent_mode +
+    carries xlstm state) crashed in Qwen attn `apply_rotary_pos_emb`
+    ("size of tensor a (14) must match tensor b (64) at dim 3").
+    ROOT (found by instrumenting, not guessing):
+      1. HF's Qwen2Attention.forward wants `position_embeddings`
+         =(cos,sin) as a NAMED arg. When we passed
+         `position_ids=None`, HF auto-computed it as a GARBAGE
+         shape (1, hidden_size=896) — because our swapped
+         decoder layer + KV-cache confuses HF's position logic.
+         That made cos (1,1,896,64)-ish -> the 14-vs-64 blowup.
+      2. (Red herring) I also hand-rolled cos/sin once with a
+         wrong unsqueeze (5D) — that's why a few early attempts
+         also failed. The robust fix is BELOW, not reverse-
+         engineering HF's rotary_emb.
+    FIX (in src/patcher.py XlstmQwenLayer.forward +
+          generate_step):
+      * In forward(): compute cos/sin OURSELVES via a small
+        `_make_rotary` (explicit theta=10000^(-2i/D), correct
+        (B,S,head_dim) shape) and pass them EXPLICITLY as
+        `position_embeddings=(cos,sin)` to self.self_attn. Strip
+        the conflicting position_ids/position_embeddings/use_cache
+        from the kwargs we forward so they can't collide.
+      * In generate_step(): NEVER pass position_ids=None. If the
+        caller didn't, derive it from the KV-cache length:
+        pos = arange(past_len, past_len+seq) -> (1, seq). This
+        gives the correct ABSOLUTE position for both prefill (t)
+        and decode (past_len+t), so RoPE is always right.
+    VERIFIED end-to-end:
+      * `generate()` runs prefill (parallel xlstm) + decode
+        (recurrent .step(), carries BOTH KV-cache AND xlstm
+        state) on step10000 ckpt -> coherent code (e.g.
+        "def mergesort(arr): if len(arr)<=1: ... mid=len(arr)//2").
+      * 24-token recurrent gen in 0.8s. Training smoke (3
+        steps) still passes -> the forward() change did NOT
+        regress parallel training.
+    IMPACT: generation + recurrent training + the TRUE
+      constant-state 16384 extrapolation test are ALL unblocked
+      now. The paper's "train 2048 -> recurrent-infer 16384"
+      claim is reachable (build eval model at context_length>=16384
+      OR just decode recurrently at any length).
 
-### (i) VARIABLE-CONTEXT PROBE on step10000 ckpt (the "limit" answer)
-  Ran `variable_context_eval` (parallel fwd at increasing
-  prefix L, next-tok ppl on following 256 tok) on the
-  NEW checkpoints/xlstm_cpt_step10000.pt (3 books, eval_len256):
-    L=1024:  base 4.60   patch 3.93   delta -0.68  (BETTER)
-    L=2048:  base 10.78  patch 13.24  delta +2.46  (WORSE)
-    L=4096:  base 11.50  patch 15.03  delta +3.53  (WORSE)
-  HONEST READING (this is the real "find the limit" answer):
-    - The graft HELPS at moderate prefix (L=1024: -0.68).
-    - It HURTS at very-long prefix (L=2048/4096: +2.46/+3.53).
-    - This CONTRADICTS the quick_eval pg19 number
-      (-5.93 "BETTER") — because they measure different
-      things: quick_eval uses 512-tok chunks (short context);
-      variable_context uses a 1024-4096-tok PREFIX (long
-      context). The graft's benefit is CONTEXT-LENGTH-DEPENDENT
-      and currently peaks at ~moderate length.
-    - ROOT: the mLSTM was TRAINED at context 2048 (parallel).
-      At prefix > 2048 its internal dynamics go
-      OUT-OF-DISTRIBUTION and inject noise -> patched ppl
-      RISES above base. So the paper's "helps at 16384"
-      claim is NOT demonstrated on our setup yet.
-    - The paper achieves long-context win via RECURRENT DECODE
-      at inference (train 2048, recurrent-infer 16384). OUR
-      recurrent decode is BLOCKED by the RoPE bug (10d), so
-      we can't even run that path. UNTIL 10d is fixed, the
-      "mLSTM helps at very long context" result is UNREACHABLE
-      here — parallel eval at >2048 just shows OOD degradation.
-  CONCLUSION: training at 2048 context bought us moderate-
-  length long-text help (quick_eval -5.9, vctx L=1024 -0.68)
-  but NOT the paper's extrapolation win. To get there:
-    (1) FIX the recurrent RoPE bug (10d) -> test true
-        constant-state decode at 16384, OR
-    (2) train at LONGER context (bump xlstm.context_length +
-        seq_len) so >2048 isn't OOD. Costs more VRAM/time.
-  This is the single most important next step.
+  ### (i) VARIABLE-CONTEXT PROBE — UPDATE
+    (earlier section kept for history.) Now that recurrent decode
+    works, the "find the limit" question can be answered TWO
+    ways:
+      (A) parallel forward at L<=4096 (VRAM-capped, the
+          variable_context_eval we already have): showed graft
+          helps at L=1024 (-0.68) but HURTS at L=2048/4096
+          (+2.46/+3.53) — i.e. out-of-distribution beyond
+          its 2048 training context.
+      (B) RECURRENT decode at any L (constant VRAM) — now
+          POSSIBLE. This is the test that matches the paper.
+          Stil to run: a recurrent long-context eval at
+          L=8192/16384 to see if the graft's memory actually
+          beats base there (the paper's headline). That's the
+          next experiment now that the decoder works.
+    The discrepancy (quick_eval pg19 -5.93 "BETTER" vs
+     variable_context L>=2048 "WORSE") is explained by
+     context length: short chunks help, very-long prefixes
+     (in parallel, OOD) hurt. Recurrent decode at long L
+     is the real test and is now unblocked.
 

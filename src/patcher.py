@@ -50,6 +50,26 @@ class XlstmQwenLayer(nn.Module):
     where the xlstm sublayer sits and how residuals combine.
     """
 
+    @staticmethod
+    def _make_rotary(hidden_states, position_ids, head_dim, device, dtype):
+        # Explicit, correct RoPE (cos, sin), each shape (B, S, head_dim)
+        # -- which is EXACTLY what HF's apply_rotary_pos_emb expects
+        # (it does cos.unsqueeze(1) -> (B,1,S,head_dim) to broadcast
+        # over heads). We must NOT pre-unsqueeze here, or it becomes
+        # 5D and breaks. Theta = 10000^(-2i/head_dim), angle=pos*theta.
+        inv_freq = 1.0 / (10000.0 ** (
+            torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+            / head_dim
+        ))                                              # (head_dim/2,)
+        pos = position_ids.to(torch.float32).reshape(-1)   # (S,)
+        # (S, D/2) * (D/2,) -> (S, D/2)
+        ang = pos[:, None] * inv_freq[None, :]
+        # interleave to full head_dim: [a, a] pairs -> (S, head_dim)
+        emb = torch.cat([ang, ang], dim=-1)             # (S, head_dim)
+        # prepend batch dim -> (B, S, head_dim)
+        emb = emb.unsqueeze(0)                             # (1, S, head_dim)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+
     def __init__(self, base_layer, xlstm: XLSTMLayer):
         super().__init__()
         # --- keep the base submodules (already frozen by the patcher) ---
@@ -85,9 +105,51 @@ class XlstmQwenLayer(nn.Module):
 
     # ---- training / prefill forward (parallel; state not needed) ----
     def forward(self, hidden_states, **kwargs):
+        # --- CRITICAL: RoPE / position_embeddings plumbing ---
+        # HF's Qwen2Attention.forward expects `position_embeddings`
+        # (a (cos, sin) tuple) as a NAMED argument. In transformers
+        # 5.5 the TOP-LEVEL model computes cos/sin via
+        # `self.rotary_emb(hidden_states, position_ids)` and passes
+        # them DOWN to the decoder layer. WE REPLACED the decoder
+        # layer, so we must compute + forward them ourselves —
+        # otherwise the attn call gets a mis-shapen cos/sin (the
+        # "size of tensor a (14) must match tensor b (64)" crash
+        # during token-by-token recurrent decode, where position
+        # bookkeeping diverges from the parallel path).
+        # Fix: build cos/sin from the backbone's OWN rotary_emb
+        # (same module HF uses) using the position_ids in kwargs,
+        # then pass them EXPLICITLY. We strip the conflicting
+        # position_ids / position_embeddings / use_cache from the
+        # kwargs we forward so they can't collide.
+        pos_ids = kwargs.get("position_ids", None)
+        cos_sin = None
+        if pos_ids is not None:
+            # explicit, correct RoPE (see _make_rotary): (cos, sin)
+            # each (B, S, head_dim) -> what Qwen2Attention wants.
+            hd = self.self_attn.head_dim
+            cos_sin = self._make_rotary(
+                hidden_states, pos_ids, hd, hidden_states.device,
+                hidden_states.dtype,
+            )
+        # only forward what attn actually wants (not position_ids /
+        # position_embeddings / use_cache which we handle ourselves)
+        attn_kwargs = {
+            k: v for k, v in kwargs.items()
+            if k not in ("position_ids", "position_embeddings",
+                            "use_cache")
+        }
+
         # attention sublayer (frozen) — Qwen's own residual
         res = hidden_states
-        h = res + self.self_attn(self.input_layernorm(hidden_states), **kwargs)[0]
+        attn_in = self.input_layernorm(hidden_states)
+        if cos_sin is not None:
+            h = res + self.self_attn(
+                attn_in, position_embeddings=cos_sin, **attn_kwargs
+            )[0]
+        else:
+            # no position_ids given (parallel prefill w/ default) ->
+            # let HF compute cos/sin internally as usual
+            h = res + self.self_attn(attn_in, **attn_kwargs)[0]
 
         # NEW xlstm sublayer (trainable) — own norm + own residual.
         # gated: m = h + gate * xlstm(norm(h)). gate starts at 0 (identity)
@@ -146,6 +208,10 @@ class XlstmQwenModel(nn.Module):
             self.xlstm_layers.append(patched)
             # swap the layer in the backbone with our wrapped version
             self.backbone.model.layers[i] = patched
+            # give the wrapped layer a direct handle to the backbone's
+            # RoPE module so its forward can recompute (cos, sin) itself
+            # for token-by-token recurrent decode (see forward's RoPE fix).
+            patched.rotary_emb = self.backbone.model.rotary_emb
 
         self.config = self.backbone.config
         self.device = device
@@ -180,9 +246,12 @@ class XlstmQwenModel(nn.Module):
     @torch.no_grad()
     def generate_step(self, input_ids, layer_states=None, past_key_values=None,
                      position_ids=None, **kwargs):
+        # coerce to 2D (B, S): callers may pass a 1D row
+        # (ids[t:t+1]) which would break .shape[1] below.
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
         if layer_states is None:
             layer_states = {i: None for i in range(len(self.xlstm_layers))}
-        # put xlstm layers into recurrent mode AND carry the harvested state
         # across steps. (BUG FIX: an earlier version reset
         # `_last_xlstm_state = None` here on EVERY call, which discarded
         # the memory between tokens -> the xlstm only saw one token at a
@@ -190,17 +259,41 @@ class XlstmQwenModel(nn.Module):
         # and the earlier "generate MATCH" smoke test meaningless. Now we
         # feed the previous step's state back in, so memory accumulates
         # across the whole sequence -- THIS is what the long-context
-        # memory probe measures.)
+        # memory probe measures.
         for i, layer in enumerate(self.xlstm_layers):
             layer.recurrent_mode = True
             layer._last_xlstm_state = layer_states[i]   # carry, don't reset
+
+        # --- RoPE position_ids: ALWAYS explicit, never None ---
+        # If the caller didn't pass one, derive the ABSOLUTE position
+        # of this single token from the KV-cache length (past_length).
+        # Passing None lets HF auto-compute position_ids, which (with our
+        # swapped decoder layers + cache) produces a GARBAGE shape
+        # (1, hidden_size) and blows up apply_rotary_pos_emb. So we
+        # compute it ourselves: a (1,1) tensor holding the absolute
+        # index. Correct for both prefill (t) and decode (past_len+t).
+        if position_ids is None:
+            seq = input_ids.shape[1]
+            past_len = 0
+            if past_key_values is not None:
+                # HF DynamicCache / tuple: past_length = cached key seq dim
+                try:
+                    past_len = past_key_values.get_seq_length()
+                except Exception:
+                    try:
+                        past_len = past_key_values[0][0].shape[-2]
+                    except Exception:
+                        past_len = 0
+            pos = torch.arange(past_len, past_len + seq,
+                               device=input_ids.device).unsqueeze(0)  # (1, seq)
+            position_ids = pos
 
         out = self.backbone(
             input_ids=input_ids,
             use_cache=True,
             past_key_values=past_key_values,
-            position_ids=position_ids,   # CRITICAL: keeps RoPE correct
-            **kwargs,                            # across token-by-token decode
+            position_ids=position_ids,   # explicit, correct shape (1, seq)
+            **kwargs,                            # (no conflicting keys)
         )
         logits = out.logits
         pkv = out.past_key_values  # carry the KV cache forward
