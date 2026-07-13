@@ -10,15 +10,25 @@ model:
   dtype: "bfloat16"
   device: "cuda"
 
-xlstm:                                  # OUR inserted mLSTM sublayer config
+xlstm:                                  # OUR inserted xLSTM sublayer config
+  block_type: "slstm"                    # "slstm" = the paper's recurrent
+                                          # long-context cell (NOT mLSTM, which
+                                          # is just a parallel training-speed insert)
+  architecture: "1:0"                    # ratio of mLSTM:sLSTM per layer.
+                                          # "1:0" = ALL sLSTM (paper's best-at-
+                                          # scale config). "7:1" = every 8th
+                                          # layer sLSTM, rest mLSTM (speed/config).
   embedding_dim: 896                     # MUST equal Qwen hidden (0.5B = 896)
-  num_heads: 4                          # mLSTM heads
-  context_length: 2048                  # recurrent kernel unroll length
-  proj_factor: 2.0                     # inner up-projection multiplier
+  num_heads: 4                          # sLSTM heads (must divide 896)
+  context_length: 2048                  # NOTE: ignored by sLSTM (truly recurrent);
+                                          # kept so the config works for mLSTM too.
+  proj_factor: 2.0                     # inner up-projection (mLSTM only; ignored by sLSTM)
   conv1d_kernel: 4                      # causal conv kernel
   bias: false
   dropout: 0.0
-  variant: "mlstm"                      # mLSTM now; sLSTM = later config option
+  bias_init: "powerlaw_blockdependent"  # PAPER GATE-INIT: forget-gate bias ramps
+                                          # +5..-7 so sLSTM starts in "remember"
+                                          # mode (the cell holds long-range state).
   lora_on_base: false                   # Stage 1: NO LoRA (full-train the block)
   insert_all_layers: true                # graft into all 24 layers
 
@@ -27,19 +37,30 @@ train:                                  # Stage 1 = continued pretraining (CPT)
   learning_rate: 1.0e-4                  # LOWERED from 5e-4: 5e-4 diverged
                                           # the graft (first run: ppl 27->1494).
   warmup_steps: 50
-  max_steps: 10000                      # overnight: ~50-90min @ ~0.5-0.9s/step
+  max_steps: 4000                       # sLSTM recurrent run: fewer steps needed
+                                          # (each step already sees a long rolled seq)
   per_device_batch: 1
-  grad_accum: 2                          # accumulate 2x1024 = 2048 tokens/step.
-                                            # 2048x1 OOMs at step1 (needs 14.65GB,
-                                            # only 1.17 free). 1024x2 peak ~7-8GB SAFE.
+  grad_accum: 2                          # accumulate 2 micro-batches/optimizer step
   grad_clip: 1.0                         # clip grad norm (stability fix, notes #9/i)
   gate_steps: 20                         # validation gate: eval + abort if diverged
-  seq_len: 1024                         # 1024 micro-batch x accum=2 = 2048 effective
-  identity_init: true                   # zero down-proj + gate=0.1 -> step0 ~= base
-  # VRAM probe (scripts/vram_probe.py) results @ RTX4060Ti 16GB:
-  #   2048 x accum=1  -> OOM at step1 (14.65GB needed, 1.17 free)
-  #   1024 x accum=1  -> 7.2 GB  GO
-  #   1024 x accum=2  -> ~7-8 GB  GO  (USED: 2048 tokens/step, safe)
+  seq_len: 2048                          # recurrent roll length per micro-batch.
+                                          # sLSTM is TRULY recurrent (no O(L^2) attn
+                                          # mask), so 2048+ rolls in constant VRAM.
+  identity_init: true                   # zero out_proj + paper forget-init -> step0 ~= base
+  # --- RECURRENT TRAINING (the paper's real long-context ingredient) ---
+  # The paper trains the recurrence via the PARALLEL xLSTM kernel (its
+  # parallel scan IS the recurrence, just parallelized -- mathematically
+  # identical to .step()). So we train in PARALLEL mode (grad-safe) at a
+  # LONG seq_len: that trains the sLSTM recurrence correctly. The
+  # token-by-token .step() path is reserved for GENERATION/eval (proven
+  # working), NOT for BPTT (the xlstm cell mutates state in-place, which
+  # breaks autograd versioning through a Python roll -- see notes).
+  recurrent: false                       # parallel forward (trains recurrence)
+  tbtt_chunk: 256                        # (unused when recurrent=false)
+  seq_len: 1024                          # long seq -> trains long-range recurrence
+                                          # (1024 fits the 16GB card at ~7GB; 2048
+                                          # needs ~12GB and is 2x slower/step)
+
   #   1024 x accum=8  ->  7.2 GB  GO
   # effective batch = seq_len * per_device_batch * grad_accum
 
@@ -74,7 +95,13 @@ eval:
   seq_len: 512            # truncate each doc to this many tokens
   long_context:           # THE memory probe (prefix > model window)
     enabled: true
-    prefix_len: 4096      # > Qwen's effective 2048 window
+    # MUST stay <= xlstm.context_length (the model's built mLSTM mask
+    # size). The training model is built at 2048, so eval prefix is
+    # capped at 2048 here. (variable_context_eval builds its OWN
+    # larger-context model for the 4096+ extrapolation test.) A
+    # hardcoded 4096 here crashed the step-20 eval gate once
+    # (mask 2048^2 can't take 4096 input — see notes #10).
+    prefix_len: 2048      # == xlstm.context_length (model's built mask)
     pred_len: 512
     probe: "emozilla/pg19"
     n_books: 4

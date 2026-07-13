@@ -202,6 +202,128 @@ def build_optimizer(model, lr: float, warmup: int, max_steps: int):
 
 
 # --- main loop ----------------------------------------------------------
+def _train_recurrent(model, data, opt, sched, device, train_cfg, start_step,
+                     ckpt_dir, smoke, eval_every, ref_base_getter):
+    """Train the graft with the RECURRENT path active (TBTT).
+
+    Each micro-batch (seq_len tokens) is rolled token-by-token through the
+    model's recurrent .step() (state carried across tokens). This is the
+    paper's real long-context ingredient: the sLSTM cell LEARNS to carry
+    long-range state, instead of only being trained in parallel (which is
+    what made the mLSTM run collapse past its training window).
+
+    Truncated BPTT: we detach the xlstm recurrent state every `tbtt_chunk`
+    tokens so the autograd graph stays shallow (constant VRAM), while the
+    STATE itself keeps flowing forward (so long-range memory is preserved).
+    """
+    from torch.nn.functional import cross_entropy
+
+    max_steps = int(train_cfg["max_steps"])
+    grad_accum = int(train_cfg.get("grad_accum", 1))
+    tbtt = int(train_cfg.get("tbtt_chunk", 256))
+    gclip = float(train_cfg.get("grad_clip", 1.0))
+    gate_steps = int(train_cfg.get("gate_steps", 20))
+
+    micro = 0
+    run_loss = 0.0
+    step = start_step
+    t0 = time.time()
+    model.train()
+
+    for ids in data:
+        if step >= max_steps:
+            break
+        ids = ids.to(device)  # (seq_len,) token stream
+        n = ids.numel()
+        # fresh recurrent state for this sequence
+        model.reset_generation()
+        layer_states = {i: None for i in range(len(model.xlstm_layers))}
+        pkv = None
+        seq_loss = 0.0
+        tok_count = 0
+        # roll token-by-token; predict token t+1 from logits at t
+        for t in range(n - 1):
+            lg, layer_states, pkv = model.generate_step(
+                ids[t:t + 1].unsqueeze(0),
+                layer_states=layer_states, past_key_values=pkv,
+                training=True)
+            # next-token CE: logits at t predict ids[t+1]
+            seq_loss = seq_loss + cross_entropy(
+                lg[0, -1:].float(), ids[t + 1:t + 2])
+            tok_count += 1
+            # TBTT: detach state every `tbtt` tokens to bound the graph
+            if (t + 1) % tbtt == 0:
+                (seq_loss / tok_count / grad_accum).backward(retain_graph=False)
+                model.zero_grad(set_to_none=True)  # drop graph, keep state values
+                # re-pin state as a fresh tensor (already detached by backward)
+                seq_loss = 0.0
+                tok_count = 0
+        # flush any remainder
+        if tok_count > 0:
+            (seq_loss / tok_count / grad_accum).backward()
+
+        run_loss += (n - 1)
+        micro += 1
+        # reset generation mode for the NEXT micro-batch (generate_step set
+        # recurrent_mode=True; keep it True, just clear the state)
+        model.reset_generation()
+
+        if micro < grad_accum:
+            continue  # accumulate micro-batches before an optimizer step
+
+        # end of accumulation cycle
+        torch.nn.utils.clip_grad_norm_(model.parameters(), gclip)
+        opt.step()
+        sched.step()
+        opt.zero_grad(set_to_none=True)
+        step += 1
+        micro = 0
+
+        if step % 1 == 0:
+            print(f"[train] step {step}/{max_steps}  "
+                  f"({time.time()-t0:.1f}s)")
+        run_loss = 0.0
+
+        # periodic eval (same gate as parallel path)
+        force_gate = (not smoke) and step == gate_steps
+        if step % eval_every == 0 or force_gate:
+            ref_base = ref_base_getter()
+            # quick parallel eval for the gate; long-context probe optional
+            eval_cfg = dict(train_cfg.get("eval_override", {}))
+            from src.eval import quick_eval
+            res = quick_eval(model, eval_cfg or {"eval_probes": ["wikitext"],
+                                                "subsample": 4, "seq_len": 128},
+                             device=device, base_model=ref_base)
+            gate_probe = "wikitext" if "wikitext" in res else next(
+                (k for k in res if isinstance(res[k], dict)), None)
+            gate_delta = (res[gate_probe]["delta_ppl"]
+                          if gate_probe and isinstance(res.get(gate_probe), dict)
+                          else float("nan"))
+            print(f"[train]   eval[{gate_probe}] delta_ppl={gate_delta:+.3f}")
+            if force_gate and gate_delta > 8.0:
+                print(f"[train] VALIDATION GATE FAILED at step {step}: "
+                      f"delta_ppl={gate_delta:.2f}. Aborting (diverged).")
+                return None
+            # also run the recurrent long-context probe at the gate (the real test)
+            try:
+                from src.eval import recurrent_long_context_eval
+                rl = recurrent_long_context_eval(
+                    model, ref_base, device,
+                    lengths=(2048, 4096), pred_len=128, n_books=1)
+                for L, r in rl.items():
+                    print(f"[train]   rlong L={L}: base={r['base_ppl']:.2f} "
+                          f"patch={r['patch_ppl']:.2f} delta={r['delta']:+.2f}")
+            except Exception as e:
+                print(f"[train]   rlong skipped: {repr(e)[:120]}")
+
+    ckpt_path = os.path.join(ckpt_dir, "xlstm_cpt_step%d.pt" % step)
+    torch.save({"step": step, "model": model.state_dict()}, ckpt_path)
+    print(f"[train] saved checkpoint -> {ckpt_path}")
+    print(f"[train] DONE in {time.time()-t0:.1f}s")
+    return ckpt_path
+
+
+
 def train(config_path: str, smoke: bool = False, resume: str = None):
     cfg = load_config(config_path)
     device = cfg["model"].get("device", "cuda")
@@ -254,7 +376,28 @@ def train(config_path: str, smoke: bool = False, resume: str = None):
     cfg["train"]["seq_len"] = seq_len
     data = stream_tokens(cfg, max_docs=max_docs)
 
-    # --- loop ---
+    # --- dispatch: recurrent (TBTT) vs parallel training ---
+    if train_cfg.get("recurrent", False):
+        eval_every = (2 if smoke else
+                      int(train_cfg.get("eval_every", 200)))
+        ckpt_dir = cfg["paths"]["checkpoints"]
+        os.makedirs(ckpt_dir, exist_ok=True)
+        # lazy getter so we only load the 0.5B base once, on first eval
+        _ref = {"base": None}
+        def ref_base_getter():
+            if _ref["base"] is None:
+                from transformers import Qwen2ForCausalLM
+                _ref["base"] = Qwen2ForCausalLM.from_pretrained(
+                    cfg["model"]["name"], torch_dtype=dtype
+                ).to(device).requires_grad_(False)
+            return _ref["base"]
+        print(f"[train] RECURRENT training mode (TBTT chunk="
+              f"{train_cfg.get('tbtt_chunk', 256)}, seq_len={seq_len})")
+        return _train_recurrent(
+            model, data, opt, sched, device, train_cfg, start_step,
+            ckpt_dir, smoke, eval_every, ref_base_getter)
+
+    # --- loop (PARALLEL forward path) ---
     max_steps = 2 if smoke else int(train_cfg["max_steps"])
     # smoke: eval ONCE at the end (per-step eval re-loads the 0.5B base and
     # stalls on this box). Real runs eval every eval_every steps.
@@ -299,7 +442,8 @@ def train(config_path: str, smoke: bool = False, resume: str = None):
         if step % 1 == 0:
             lr = sched.get_last_lr()[0]
             print(f"[train] step {step}/{max_steps}  loss={run_loss/grad_accum:.4f}  "
-                  f"lr={lr:.2e}  ({time.time()-t0:.1f}s)")
+                  f"lr={lr:.2e}  ({time.time()-t0:.1f}s/step)", flush=True)
+            t0 = time.time()  # reset so the next line shows PER-STEP time, not cumulative
         run_loss = 0.0
 
         # periodic eval: patched vs frozen-base perplexity delta.

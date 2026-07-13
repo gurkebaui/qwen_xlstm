@@ -124,13 +124,15 @@ class XlstmQwenLayer(nn.Module):
         pos_ids = kwargs.get("position_ids", None)
         cos_sin = None
         if pos_ids is not None:
-            # explicit, correct RoPE (see _make_rotary): (cos, sin)
-            # each (B, S, head_dim) -> what Qwen2Attention wants.
-            hd = self.self_attn.head_dim
-            cos_sin = self._make_rotary(
-                hidden_states, pos_ids, hd, hidden_states.device,
-                hidden_states.dtype,
-            )
+            # Use the BACKBONE's own rotary_emb — the EXACT module HF's
+            # top-level forward uses to compute (cos, sin). This guarantees
+            # our attention gets bit-identical RoPE to the frozen base
+            # (so a zeroed graft => model == base at step 0). A hand-rolled
+            # _make_rotary looked "close enough" to run but diverged from
+            # HF by up to ~0.7 logits, breaking the identity contract.
+            # rotary_emb returns (cos, sin) each (B, S, head_dim) -- which is
+            # exactly the shape HF's apply_rotary_pos_emb wants.
+            cos_sin = self.rotary_emb(hidden_states, pos_ids)
         # only forward what attn actually wants (not position_ids /
         # position_embeddings / use_cache which we handle ourselves)
         attn_kwargs = {
@@ -194,9 +196,30 @@ class XlstmQwenModel(nn.Module):
         # --- insert one trainable xlstm sublayer per decoder layer ---
         # the xlstm layer must match the backbone dtype (Qwen loads in bfloat16);
         # the real layer defaults to float32, so we cast it explicitly.
+        # The architecture ratio (from config) decides mLSTM vs sLSTM per layer:
+        #   "1:0" -> every layer sLSTM (the paper's best-at-scale config)
+        #   "7:1" -> every 8th layer sLSTM, the rest mLSTM (the speed/config)
+        # Both cells share the SAME XLSTMLayerConfig; only block_type flips.
+        num_layers = len(self.backbone.model.layers)
+        block_type_seq = self._block_type_sequence(
+            xlstm_cfg.architecture, num_layers
+        )
         self.xlstm_layers: nn.ModuleList = nn.ModuleList()
         for i, base_layer in enumerate(self.backbone.model.layers):
-            xl = XLSTMLayer(xlstm_cfg)
+            # per-layer config: copy shared dims, set this layer's cell type
+            layer_cfg = XLSTMLayerConfig(
+                block_type=block_type_seq[i],
+                embedding_dim=xlstm_cfg.embedding_dim,
+                num_heads=xlstm_cfg.num_heads,
+                context_length=xlstm_cfg.context_length,
+                proj_factor=xlstm_cfg.proj_factor,
+                conv1d_kernel=xlstm_cfg.conv1d_kernel,
+                bias=xlstm_cfg.bias,
+                dropout=xlstm_cfg.dropout,
+                bias_init=xlstm_cfg.bias_init,
+                architecture=xlstm_cfg.architecture,
+            )
+            xl = XLSTMLayer(layer_cfg)
             xl = xl.to(self.backbone.dtype)
             patched = XlstmQwenLayer(base_layer, xl)
             # base submodule params stay frozen (requires_grad False inherited);
@@ -215,6 +238,36 @@ class XlstmQwenModel(nn.Module):
 
         self.config = self.backbone.config
         self.device = device
+
+    @staticmethod
+    def _block_type_sequence(architecture: str, num_layers: int) -> list:
+        """Map a ratio string to a per-layer block_type sequence.
+
+        "1:0" -> all "slstm" (paper's best-at-scale config).
+        "7:1" -> pattern of 7 mLSTM + 1 sLSTM; we place an sLSTM at the
+                LAST layer of every group of 8 (indices 7,15,23,...), so a
+                24-layer Qwen gets 3 sLSTM + 21 mLSTM (exactly 7:1).
+        Any "a:b" -> every (a+b)-th layer from the end is sLSTM, rest mLSTM.
+        """
+        # parse "a:b"
+        try:
+            a, b = architecture.split(":")
+            a, b = int(a), int(b)
+        except Exception:
+            a, b = 1, 0
+        period = a + b
+        if period <= 0:
+            period = 1
+        seq = []
+        for i in range(num_layers):
+            # place sLSTM at the "boundary" positions: i % period == period-1
+            if b == 0:
+                seq.append("slstm")        # pure sLSTM
+            elif period > 1 and (i % period) == (period - 1):
+                seq.append("slstm")
+            else:
+                seq.append("mlstm")
+        return seq
 
     # ---------------------------------------------------------------- #
     # TRAINING forward: delegates to the backbone (each wrapped layer runs  #
@@ -243,9 +296,26 @@ class XlstmQwenModel(nn.Module):
     #   * the xLSTM recurrent state (matrix memory + conv) -> our memory.   #
     # `generate_step` threads BOTH. `generate()` orchestrates the loop.      #
     # ---------------------------------------------------------------- #
-    @torch.no_grad()
     def generate_step(self, input_ids, layer_states=None, past_key_values=None,
-                     position_ids=None, **kwargs):
+                     position_ids=None, training: bool = False, **kwargs):
+        # `training=True` keeps gradients flowing (recurrent/TBTT training);
+        # otherwise we wrap in no_grad for fast inference. The @torch.no_grad()
+        # decorator was removed because the recurrent trainer needs grads.
+        if not training:
+            return self._generate_step_no_grad(
+                input_ids, layer_states, past_key_values, position_ids, **kwargs)
+        # grad-enabled path:
+        return self._generate_step_core(
+            input_ids, layer_states, past_key_values, position_ids, **kwargs)
+
+    @torch.no_grad()
+    def _generate_step_no_grad(self, input_ids, layer_states=None,
+                               past_key_values=None, position_ids=None, **kwargs):
+        return self._generate_step_core(
+            input_ids, layer_states, past_key_values, position_ids, **kwargs)
+
+    def _generate_step_core(self, input_ids, layer_states=None,
+                            past_key_values=None, position_ids=None, **kwargs):
         # coerce to 2D (B, S): callers may pass a 1D row
         # (ids[t:t+1]) which would break .shape[1] below.
         if input_ids.dim() == 1:
@@ -262,7 +332,16 @@ class XlstmQwenModel(nn.Module):
         # memory probe measures.
         for i, layer in enumerate(self.xlstm_layers):
             layer.recurrent_mode = True
-            layer._last_xlstm_state = layer_states[i]   # carry, don't reset
+            # CLONE the carried state before handing it to the layer: the
+            # xlstm cell mutates conv_state IN PLACE during .step(), and reusing
+            # the same tensor object as the next step's graph input corrupts
+            # autograd versioning (breaks TBTT: "modified by an inplace
+            # operation"). Cloning decouples each step's graph safely.
+            st = layer_states[i]
+            if st is not None:
+                st = {k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                      for k, v in st.items()}
+            layer._last_xlstm_state = st
 
         # --- RoPE position_ids: ALWAYS explicit, never None ---
         # If the caller didn't pass one, derive the ABSOLUTE position
