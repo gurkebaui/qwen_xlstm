@@ -70,7 +70,7 @@ class XlstmQwenLayer(nn.Module):
         emb = emb.unsqueeze(0)                             # (1, S, head_dim)
         return emb.cos().to(dtype), emb.sin().to(dtype)
 
-    def __init__(self, base_layer, xlstm: XLSTMLayer):
+    def __init__(self, base_layer, xlstm: XLSTMLayer, dtype=torch.bfloat16):
         super().__init__()
         # --- keep the base submodules (already frozen by the patcher) ---
         self.input_layernorm = base_layer.input_layernorm      # norm before attn
@@ -81,7 +81,11 @@ class XlstmQwenLayer(nn.Module):
         # --- our new sublayer: a THIRD norm + the xlstm block ---
         # norm dim must match hidden size
         hidden = base_layer.input_layernorm.weight.shape[0]
-        self.xlstm_layernorm = nn.RMSNorm(hidden, eps=1e-6)
+        # CAST to the model dtype (bf16)! nn.RMSNorm defaults to float32, and
+        # a float32 norm weight vs bf16 input forces PyTorch onto the SLOW
+        # non-fused RMSNorm path ("Mismatch dtype ... Cannot dispatch to fused
+        # implementation") -> +several seconds/step. This was a real slowdown.
+        self.xlstm_layernorm = nn.RMSNorm(hidden, eps=1e-6).to(dtype)
         self.xlstm = xlstm
 
         # --- learnable GATE on the xlstm branch (stability fix, notes #9/i) ---
@@ -93,7 +97,7 @@ class XlstmQwenLayer(nn.Module):
         # down_proj a real gradient from step 0, so the branch is trainable.
         # Step-0 output is still ~= base because xlstm_out~0 (down_proj=0), so
         # the identity contract holds (smoke delta=0); the gate just lets it LEARN.
-        self.gate = nn.Parameter(torch.full((1,), 0.1))
+        self.gate = nn.Parameter(torch.full((1,), 0.1, dtype=dtype))
 
         # --- generation mode toggle ---
         # False (default): xLSTM runs in PARALLEL .forward()  -> training + prefill.
@@ -221,7 +225,7 @@ class XlstmQwenModel(nn.Module):
             )
             xl = XLSTMLayer(layer_cfg)
             xl = xl.to(self.backbone.dtype)
-            patched = XlstmQwenLayer(base_layer, xl)
+            patched = XlstmQwenLayer(base_layer, xl, dtype=self.backbone.dtype)
             # base submodule params stay frozen (requires_grad False inherited);
             # the xlstm + its new norm must be TRAINABLE:
             for p in patched.xlstm.parameters():

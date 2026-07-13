@@ -1,0 +1,65 @@
+data:
+  eval_probes:
+  - wikitext
+  - bigcode/starcoderdata:python
+  - emozilla/pg19
+  sources:
+  - bigcode/starcoderdata:python
+  - emozilla/pg19
+  - open-web-math/open-web-math
+  - HuggingFaceTB/smollm-corpus:fineweb-edu-dedup
+  - wikitext
+eval:
+  downstream_later:
+  - HumanEval
+  - MBPP
+  - GSM8K
+  - MATH-500
+  eval_probes:
+  - wikitext
+  - bigcode/starcoderdata:python
+  - emozilla/pg19
+  long_context:
+    enabled: true
+    n_books: 4
+    pred_len: 512
+    prefix_len: 2048
+    probe: emozilla/pg19
+  seq_len: 512
+  subsample: 32
+model:
+  device: cuda
+  dtype: bfloat16
+  name: Qwen/Qwen2.5-Coder-0.5B
+paths:
+  checkpoints: checkpoints/
+  results: results/
+  runs: runs/
+train:
+  eval_every: 60
+  gate_steps: 20
+  grad_accum: 2
+  grad_clip: 1.0
+  identity_init: true
+  learning_rate: 0.0001
+  max_steps: 60
+  mode: cpt
+  per_device_batch: 1
+  recurrent: false
+  save_every: 60
+  seq_len: 1024
+  tbtt_chunk: 256
+  warmup_steps: 50
+xlstm:
+  architecture: '1:0'
+  bias: false
+  bias_init: powerlaw_blockdependent
+  block_type: slstm
+  context_length: 2048
+  conv1d_kernel: 4
+  dropout: 0.0
+  embedding_dim: 896
+  insert_all_layers: true
+  lora_on_base: false
+  num_heads: 4
+  proj_factor: 2.0
