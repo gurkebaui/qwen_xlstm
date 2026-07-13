@@ -70,7 +70,8 @@ class XlstmQwenLayer(nn.Module):
         emb = emb.unsqueeze(0)                             # (1, S, head_dim)
         return emb.cos().to(dtype), emb.sin().to(dtype)
 
-    def __init__(self, base_layer, xlstm: XLSTMLayer, dtype=torch.bfloat16):
+    def __init__(self, base_layer, xlstm: XLSTMLayer, dtype=torch.bfloat16,
+                 base_ctx=None):
         super().__init__()
         # --- keep the base submodules (already frozen by the patcher) ---
         self.input_layernorm = base_layer.input_layernorm      # norm before attn
@@ -106,6 +107,13 @@ class XlstmQwenLayer(nn.Module):
         # carried state on the layer so the caller can read it back.
         self.recurrent_mode = False
         self._last_xlstm_state = None
+
+        # --- HYBRID context split (2026-07-13) ---
+        # if set: the frozen base attention processes LOCAL windows of
+        # `base_ctx` tokens (cheap, O(L*base_ctx)); the trainable sLSTM
+        # processes the FULL sequence (O(L) parallel scan) -> global recurrent
+        # memory at a fraction of the base-attn cost. None = base sees full seq.
+        self.base_ctx = base_ctx
 
     # ---- training / prefill forward (parallel; state not needed) ----
     def forward(self, hidden_states, **kwargs):
@@ -148,7 +156,24 @@ class XlstmQwenLayer(nn.Module):
         # attention sublayer (frozen) — Qwen's own residual
         res = hidden_states
         attn_in = self.input_layernorm(hidden_states)
-        if cos_sin is not None:
+        if self.base_ctx is not None and not self.recurrent_mode and pos_ids is None:
+            # HYBRID: base attention sees only LOCAL windows of `base_ctx`
+            # tokens (cheap, O(L*base_ctx)). The sLSTM below still processes
+            # the FULL `h` -> global recurrent memory. RoPE uses the chunk's
+            # ABSOLUTE positions so the local window is positioned correctly.
+            L = hidden_states.shape[1]
+            bc = int(self.base_ctx)
+            h_parts = []
+            for s in range(0, L, bc):
+                e = min(s + bc, L)
+                chunk = attn_in[:, s:e, :]
+                cpos = torch.arange(s, e, device=hidden_states.device).unsqueeze(0)
+                ccos = self.rotary_emb(chunk, cpos)
+                h_parts.append(
+                    chunk + self.self_attn(
+                        chunk, position_embeddings=ccos, **attn_kwargs)[0])
+            h = res + torch.cat(h_parts, dim=1)
+        elif cos_sin is not None:
             h = res + self.self_attn(
                 attn_in, position_embeddings=cos_sin, **attn_kwargs
             )[0]
@@ -225,7 +250,8 @@ class XlstmQwenModel(nn.Module):
             )
             xl = XLSTMLayer(layer_cfg)
             xl = xl.to(self.backbone.dtype)
-            patched = XlstmQwenLayer(base_layer, xl, dtype=self.backbone.dtype)
+            patched = XlstmQwenLayer(base_layer, xl, dtype=self.backbone.dtype,
+                                   base_ctx=xlstm_cfg.base_ctx)
             # base submodule params stay frozen (requires_grad False inherited);
             # the xlstm + its new norm must be TRAINABLE:
             for p in patched.xlstm.parameters():

@@ -29,6 +29,12 @@ xlstm:                                  # OUR inserted xLSTM sublayer config
   bias_init: "powerlaw_blockdependent"  # PAPER GATE-INIT: forget-gate bias ramps
                                           # +5..-7 so sLSTM starts in "remember"
                                           # mode (the cell holds long-range state).
+  base_ctx: 128                         # HYBRID context split (2026-07-13):
+                                          # frozen base attention sees LOCAL windows
+                                          # of `base_ctx` tokens (cheap, O(L*base_ctx));
+                                          # trainable sLSTM processes the FULL seq
+                                          # (O(L) parallel scan) -> global memory at
+                                          # ~8x less base-attn compute. None = full.
   lora_on_base: false                   # Stage 1: NO LoRA (full-train the block)
   insert_all_layers: true                # graft into all 24 layers
 

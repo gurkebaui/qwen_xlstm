@@ -331,7 +331,8 @@ def train(config_path: str, smoke: bool = False, resume: str = None):
     # our XLSTMLayerConfig only takes the real-layer dims; strip plan-level
     # switches (variant/lora_on_base/insert_all_layers) that live under xlstm:.
     _dim_keys = {"embedding_dim", "num_heads", "context_length",
-                 "proj_factor", "conv1d_kernel", "bias", "dropout"}
+                 "proj_factor", "conv1d_kernel", "bias", "dropout",
+                 "base_ctx"}
     xlstm_cfg = XLSTMLayerConfig(
         **{k: v for k, v in cfg["xlstm"].items() if k in _dim_keys}
     )
