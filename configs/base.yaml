@@ -42,8 +42,13 @@ train:                                  # Stage 1 = continued pretraining (CPT)
   grad_accum: 1                          # 1 micro-batch/step -> clean timing, faster/step
   grad_clip: 1.0                         # clip grad norm (stability fix, notes #9/i)
   gate_steps: 20                         # validation gate: eval + abort if diverged
-  seq_len: 1024                          # long seq -> trains long-range recurrence
-                                          # (1024 fits the 16GB card at ~7GB)
+  seq_len: 256                           # SPEED LEVER (proven, runs/time_seqlen.log):
+                                          # 256->3.25s/step, 512->6.97s, 1024->13.3s.
+                                          # ~L^2: 1024 is 4x slower than 256 for the
+                                          # SAME step count. mLSTM ran ~1h @256; the
+                                          # prior 1024 run was the 4x slowdown. The
+                                          # sLSTM is recurrent (cheap); the frozen base
+                                          # attention is what scales. 256 = ~1.3h/1500.
   identity_init: true                   # zero out_proj + paper forget-init -> step0 ~= base
 
 data:                                   # code / math / long-context (the memory space)
