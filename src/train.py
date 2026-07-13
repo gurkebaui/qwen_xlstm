@@ -404,6 +404,12 @@ def train(config_path: str, smoke: bool = False, resume: str = None):
     eval_every = max_steps if smoke else int(train_cfg.get("eval_every", 200))
     ckpt_dir = cfg["paths"]["checkpoints"]
     os.makedirs(ckpt_dir, exist_ok=True)
+    # periodic checkpointing so a long run can be stopped/inspected mid-way
+    # (the live model only autosaved at the very end before this).
+    save_every = int(train_cfg.get("save_every", max_steps))
+    # graceful stop: touch this file and the run saves a checkpoint + exits
+    # cleanly at the next step boundary (lets us halt a long run on demand).
+    stop_file = os.path.join(ckpt_dir, "STOP")
 
     step = start_step
     t0 = time.time()
@@ -417,6 +423,14 @@ def train(config_path: str, smoke: bool = False, resume: str = None):
     for ids in data:
         if step >= max_steps:
             break
+        # graceful-stop signal: save + exit at this boundary
+        if os.path.exists(stop_file):
+            print(f"[train] STOP file seen -> saving checkpoint at step {step}")
+            torch.save({"step": step, "model": model.state_dict()},
+                       os.path.join(ckpt_dir, "xlstm_cpt_step%d.pt" % step))
+            print(f"[train] saved early checkpoint -> "
+                  f"{os.path.join(ckpt_dir, 'xlstm_cpt_step%d.pt' % step)}")
+            return os.path.join(ckpt_dir, "xlstm_cpt_step%d.pt" % step)
         ids = ids.unsqueeze(0).to(device)  # (1, seq_len)
         out = model(input_ids=ids, labels=ids)
         # scale loss by accum so the effective batch grad magnitude matches
@@ -446,55 +460,70 @@ def train(config_path: str, smoke: bool = False, resume: str = None):
             t0 = time.time()  # reset so the next line shows PER-STEP time, not cumulative
         run_loss = 0.0
 
+        # periodic checkpoint (not just at the end)
+        if step % save_every == 0:
+            torch.save({"step": step, "model": model.state_dict()},
+                       os.path.join(ckpt_dir, "xlstm_cpt_step%d.pt" % step))
+            print(f"[train] checkpoint -> "
+                  f"{os.path.join(ckpt_dir, 'xlstm_cpt_step%d.pt' % step)}")
+
         # periodic eval: patched vs frozen-base perplexity delta.
         # Also force an eval at the validation-gate step (step 20 by default)
         # so we catch divergence EARLY, before the next scheduled eval.
+        # ROBUSTNESS: eval must NEVER abort training. A dataset 403 / network
+        # blip inside quick_eval used to kill the whole run (see 2026-07-13
+        # TRAIN_EXIT=1 at step 20). Now eval failures are logged and skipped.
         force_gate = (not smoke) and step == gate_steps
         if step % eval_every == 0 or force_gate:
-            from transformers import Qwen2ForCausalLM
-            if "ref_base" not in locals():
-                ref_base = Qwen2ForCausalLM.from_pretrained(
-                    cfg["model"]["name"], torch_dtype=dtype
-                ).to(device)
-                ref_base.requires_grad_(False)
-            eval_cfg = dict(cfg["eval"])
-            eval_cfg["subsample"] = 4 if smoke else int(eval_cfg.get("subsample", 32))
-            eval_cfg["seq_len"] = min(seq_len, 128) if smoke else int(eval_cfg.get("seq_len", 512))
-            res = quick_eval(model, eval_cfg, device=device, base_model=ref_base)
-            # quick_eval returns {probe: {base_ppl, patched_ppl, delta_ppl}}
-            #   (keyed per-probe). Summarize each, pick a representative
-            #   delta for the gate (wikitext if present, else first probe).
-            for probe_name, pdict in res.items():
-                if probe_name == "long_context":
-                    continue  # long-context handled by its own print below
-                if not isinstance(pdict, dict):
-                    continue
-                print(f"[train]   eval[{probe_name}] "
-                      f"delta_ppl={pdict.get('delta_ppl', float('nan')):+.3f} "
-                      f"(base={pdict.get('base_ppl', float('nan')):.2f} "
-                      f"patched={pdict.get('patched_ppl', float('nan')):.2f})")
-            # representative delta for the validation gate
-            gate_probe = "wikitext" if "wikitext" in res else next(
-                (k for k in res if isinstance(res[k], dict)), None)
-            gate_delta = (res[gate_probe]["delta_ppl"]
-                          if gate_probe and isinstance(res.get(gate_probe), dict)
-                          else float("nan"))
+            try:
+                from transformers import Qwen2ForCausalLM
+                if "ref_base" not in locals():
+                    ref_base = Qwen2ForCausalLM.from_pretrained(
+                        cfg["model"]["name"], torch_dtype=dtype
+                    ).to(device)
+                    ref_base.requires_grad_(False)
+                eval_cfg = dict(cfg["eval"])
+                eval_cfg["subsample"] = 4 if smoke else int(eval_cfg.get("subsample", 32))
+                eval_cfg["seq_len"] = min(seq_len, 128) if smoke else int(eval_cfg.get("seq_len", 512))
+                res = quick_eval(model, eval_cfg, device=device, base_model=ref_base)
+                # quick_eval returns {probe: {base_ppl, patched_ppl, delta_ppl}}
+                #   (keyed per-probe). Summarize each, pick a representative
+                #   delta for the gate (wikitext if present, else first probe).
+                for probe_name, pdict in res.items():
+                    if probe_name == "long_context":
+                        continue  # long-context handled by its own print below
+                    if not isinstance(pdict, dict):
+                        continue
+                    print(f"[train]   eval[{probe_name}] "
+                          f"delta_ppl={pdict.get('delta_ppl', float('nan')):+.3f} "
+                          f"(base={pdict.get('base_ppl', float('nan')):.2f} "
+                          f"patched={pdict.get('patched_ppl', float('nan')):.2f})")
+                # representative delta for the validation gate
+                gate_probe = "wikitext" if "wikitext" in res else next(
+                    (k for k in res if isinstance(res[k], dict)), None)
+                gate_delta = (res[gate_probe]["delta_ppl"]
+                              if gate_probe and isinstance(res.get(gate_probe), dict)
+                              else float("nan"))
 
-            # --- 20-STEP VALIDATION GATE (notes #9/i) ---
-            # Abort early if the recipe diverges: if at the gate the patched
-            # model is WORSE than base by a lot, the recipe is bad -> stop
-            # instead of burning a full run. Only in the real (non-smoke) run.
-            if force_gate:
-                if gate_delta > 5.0:   # patched >5 ppl worse than base
-                    print(f"[train] VALIDATION GATE FAILED at step {step}: "
-                          f"delta_ppl={gate_delta:.2f} (patched much worse). "
-                          f"Aborting — recipe diverges. Fix LR/clip/gate, don't "
-                          f"waste a full run.")
-                    return ckpt_dir  # no checkpoint of a diverged run
-                else:
-                    print(f"[train] VALIDATION GATE PASSED at step {step}: "
-                          f"delta_ppl={gate_delta:+.2f}. Recipe stable; "
-                          f"continuing full run.")
+                # --- 20-STEP VALIDATION GATE (notes #9/i) ---
+                # Abort early if the recipe diverges: if at the gate the patched
+                # model is WORSE than base by a lot, the recipe is bad -> stop
+                # instead of burning a full run. Only in the real (non-smoke) run.
+                if force_gate:
+                    if gate_delta > 5.0:   # patched >5 ppl worse than base
+                        print(f"[train] VALIDATION GATE FAILED at step {step}: "
+                              f"delta_ppl={gate_delta:.2f} (patched much worse). "
+                              f"Aborting — recipe diverges. Fix LR/clip/gate, don't "
+                              f"waste a full run.")
+                        return ckpt_dir  # no checkpoint of a diverged run
+                    else:
+                        print(f"[train] VALIDATION GATE PASSED at step {step}: "
+                              f"delta_ppl={gate_delta:+.2f}. Recipe stable; "
+                              f"continuing full run.")
+            except Exception as eval_err:
+                print(f"[train] eval at step {step} FAILED (non-fatal, skipping): "
+                      f"{type(eval_err).__name__}: {eval_err}")
+                # gate can't fire without eval; continue training regardless.
 
     # --- checkpoint (NEVER /tmp) ---
     ckpt_path = os.path.join(ckpt_dir, "xlstm_cpt_step%d.pt" % step)
