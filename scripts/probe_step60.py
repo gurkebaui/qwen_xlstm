@@ -27,7 +27,9 @@ def main():
     ap.add_argument("--lengths", nargs="+", type=int,
                     default=[2048, 4096, 8192, 16384])
     ap.add_argument("--pred-len", type=int, default=256)
-    ap.add_argument("--n-books", type=int, default=3)
+    ap.add_argument("--probe-source", default="wikitext",
+                    help="long-text source for the probe (wikitext is cached/local; "
+                         "emozilla/pg19 needs HF auth and 403s here)")
     args = ap.parse_args()
 
     DEVICE = "cuda"
@@ -54,7 +56,7 @@ def main():
     res = recurrent_long_context_eval(
         model, base, device=DEVICE,
         lengths=tuple(args.lengths), pred_len=args.pred_len,
-        n_books=args.n_books,
+        n_books=args.n_books, probe=args.probe_source,
     )
     print("\n=== RECURRENT LONG-CONTEXT PROBE (sLSTM step-%s) ===" % ck.get("step"))
     for L, r in res.items():

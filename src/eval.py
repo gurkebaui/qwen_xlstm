@@ -115,22 +115,36 @@ def _perplexity(model, doc_ids: List[torch.Tensor], device: str,
 # --- long-context MEMORY probe (the real "does memory help?" test) ----
 @torch.no_grad()
 def long_context_eval(patched_model, base_model, device: str,
-                     prefix_len: int = 4096, pred_len: int = 512,
-                     probe: str = "emozilla/pg19", n_books: int = 4):
+                      prefix_len: int = 2048, pred_len: int = 512,
+                      probe: str = "emozilla/pg19", n_books: int = 4):
     """The probe that actually tests the graft's memory.
 
     A standard next-token perplexity only sees `seq_len` tokens, so it
     never exercises long-range recall. Here we take a LONG book (pg19,
-    100k+ tok), feed `prefix_len` tokens as context (4096 > Qwen's
-    effective 2048 window), then measure next-token ppl on the
-    FOLLOWING `pred_len` tokens.
+    100k+ tok), feed `prefix_len` tokens as context, then measure
+    next-token ppl on the FOLLOWING `pred_len` tokens.
 
-    The frozen base can't see past its window, so its prediction there
-    is from short-range only. The graft's mLSTM carries recurrent
-    state across the whole prefix -> if it helps, patched ppl on the
-    post-window chunk should be LOWER than base. That's the win.
-    The delta here is the metric that matters, not wikitext ppl.
+    The frozen base can't see past its window, so its prediction
+    there is from short-range only. The graft's mLSTM carries
+    recurrent state across the whole prefix -> if it helps, patched
+    ppl on the post-window chunk should be LOWER than base.
+
+    GUARD: prefix_len is clamped to the model's BUILT context_length
+    (the mLSTM causal-mask is context_length^2; feeding more
+    crashes at dim 3). The training model is built at 2048, so
+    the eval prefix caps at 2048. variable_context_eval is the
+    separate probe that builds its OWN larger-context model for
+    the 4096+ extrapolation test.
     """
+    # clamp to the model's built mLSTM context (defensive)
+    try:
+        ctx = int(patched_model.xlstm_layers[0].xlstm.config.context_length)
+        if prefix_len > ctx:
+            print(f"[long] clamping prefix_len {prefix_len} -> {ctx} "
+                  f"(model's built mLSTM context_length)")
+            prefix_len = ctx
+    except Exception:
+        pass
     from datasets import load_dataset
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-0.5B")
@@ -280,6 +294,125 @@ def variable_context_eval(patched_model, base_model, device: str,
         rp = float(torch.exp(torch.tensor(pl_patch / tk)).item())
         out[L] = {"base_ppl": rb, "patch_ppl": rp, "delta": rp - rb}
         print(f"[vctx] L={L:6d} books={ok}: base_ppl={rb:.2f} "
+              f"patch_ppl={rp:.2f} delta={rp - rb:+.2f} "
+              f"({'patch BETTER' if rp < rb else 'patch WORSE'})")
+    return out
+
+
+# --- RECURRENT long-context eval (the paper's headline test) -------------
+# The graft's whole selling point: train at 2048, then RECURRENTLY
+# decode at 16384 with CONSTANT VRAM (mLSTM's O(1) recurrent state).
+# This probe exercises exactly that:
+#   * roll the WHOLE prefix+post token-by-token via generate_step
+#     (recurrent .step() + carries BOTH the KV cache AND the xlstm
+#     state). VRAM stays O(1) per step regardless of sequence length.
+#   * accumulate next-token cross-entropy over the post tokens.
+#     logits[t] predict token t+1; we compare logits over post against
+#     the TRUE post tokens -> correct next-token ppl.
+# Compared against the FROZEN base, which rolls the SAME sequence via
+# KV-cache (no recurrent memory). If the graft's long-range memory
+# helps, patched ppl at L=8192/16384 should be <= base.
+#
+# This is CONSTANT VRAM by construction (each step is 1 token), so it
+# sidesteps the O(L^2) attention mask that caps the PARALLEL
+# variable_context_eval at ~4096 on 16GB. It is the test the paper's
+# "train 2048 -> recurrent-infer 16384" headline actually refers to.
+@torch.no_grad()
+def recurrent_long_context_eval(patched_model, base_model, device: str,
+                                lengths=(2048, 4096, 8192, 16384),
+                                pred_len: int = 256,
+                                probe: str = "emozilla/pg19",
+                                n_books: int = 3, max_scanned: int = 300):
+    """Measure next-token ppl at increasing prefix L using RECURRENT decode.
+
+    For each L: pg19 book, tokenize to L+pred_len. Both models roll the
+    prefix+L post chunk token-by-token (patched carries xlstm state +
+    KV cache; base carries KV cache only). Next-token CE over the post
+    tokens is compared.
+
+    Returns: {L: {base_ppl, patch_ppl, delta}}.
+    """
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-0.5B")
+
+    max_L = max(lengths)
+    need_chars = (max_L + pred_len) * 2
+
+    ds = (load_dataset("wikitext", name="wikitext-103-v1", split="train",
+                        streaming=True)
+          if probe == "wikitext"
+          else load_dataset(probe, split="train", streaming=True))
+    it = iter(ds)
+    books_text = []
+    scanned = 0
+    while len(books_text) < n_books and scanned < max_scanned:
+        scanned += 1
+        row = next(it, None)
+        if row is None:
+            break
+        text = row.get("text") or ""
+        if len(text) < need_chars:
+            continue
+        books_text.append(text)
+
+    if not books_text:
+        print(f"[rlong] FOUND 0 books >= {need_chars} chars after "
+              f"{max_scanned} scanned -> cannot run")
+        return {}
+
+    ce = torch.nn.functional.cross_entropy
+    out = {}
+    for L in lengths:
+        pl_base, pl_patch, tk = 0.0, 0.0, 0
+        ok = 0
+        for text in books_text:
+            ids = tok(text, return_tensors="pt", truncation=True,
+                      max_length=L + pred_len).input_ids[0].to(device)
+            if ids.numel() < L + pred_len:
+                continue
+            pre, post = ids[:L], ids[L:L + pred_len]
+            full = torch.cat([pre, post])  # roll this WHOLE thing
+
+            # ---- PATCHED: recurrent roll (constant VRAM) ----
+            patched_model.reset_generation()
+            ls = {i: None for i in range(len(patched_model.xlstm_layers))}
+            pkv = None
+            # roll prefix (carries state), then post (accumulate CE)
+            for t in range(full.numel()):
+                lg, ls, pkv = patched_model.generate_step(
+                    full[t:t + 1].unsqueeze(0),
+                    layer_states=ls, past_key_values=pkv,
+                )
+                if t >= L:  # only post tokens contribute to the metric
+                    # logits at step t predict token t+1 (== full[t+1])
+                    if t + 1 < full.numel():
+                        pl_patch += ce(lg[0, -1:].float(),
+                                       full[t + 1:t + 2]).item()
+                        tk += 1
+            patched_model.reset_generation()
+
+            # ---- BASE: recurrent roll via KV cache (no xlstm) ----
+            bls = None
+            bkv = None
+            for t in range(full.numel()):
+                out_b = base_model(input_ids=full[t:t + 1].unsqueeze(0),
+                                   use_cache=True, past_key_values=bkv)
+                bkv = out_b.past_key_values
+                if t >= L and t + 1 < full.numel():
+                    pl_base += ce(out_b.logits[0, -1:].float(),
+                                  full[t + 1:t + 2]).item()
+            del bkv
+
+            ok += 1
+
+        if tk == 0:
+            print(f"[rlong] L={L}: no usable books, skip")
+            continue
+        rb = float(torch.exp(torch.tensor(pl_base / tk)).item())
+        rp = float(torch.exp(torch.tensor(pl_patch / tk)).item())
+        out[L] = {"base_ppl": rb, "patch_ppl": rp, "delta": rp - rb}
+        print(f"[rlong] L={L:6d} books={ok}: base_ppl={rb:.2f} "
               f"patch_ppl={rp:.2f} delta={rp - rb:+.2f} "
               f"({'patch BETTER' if rp < rb else 'patch WORSE'})")
     return out
