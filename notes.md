@@ -290,11 +290,63 @@ DATE: 2026-07-13   STATUS: eval done (parallel), recurrent decode BROKEN
   The recurrence is SUPPOSED to beat this (constant state) — but
   that needs (d) fixed first.
 
-### (f) Fine-tuning plan written
-  `docs/finetune_plan.md` — Stage 1 (CPT, this run) -> Stage 2
-  (SFT, unfreeze all, code+reason+agentic+long-text data from
-  ToolBench/AgentInstruct/PG19-QA) -> Stage 3 (GRPO RL,
-  outcome rewards). Library call: TRL SFTTrainer accepts nn.Module
-  (OK for us); GRPOTrainer needs PreTrainedModel -> we must wrap
-  XlstmQwenModel as one, or self-implement GRPO. The part libs
-  can't touch (our recurrent mLSTM decode) we do ourselves.
+### (g) OVERNIGHT CPT RUN — FINAL (step 10000, 2026-07-13)
+  Resumed from step2000 -> 10000 (added `--resume` to train.py;
+  LR sched warmup restarts, fine for CPT continuation). 7152s (~2h),
+  0 crashes, ckpt `checkpoints/xlstm_cpt_step10000.pt` (1.2GB).
+  FINAL quick_eval vs FROZEN base (32-doc subsample, seq512):
+    wikitext:         base 30.76  patched 38.52  delta +7.76  (WORSE)
+    starcoder (code): base  3.15  patched  3.32  delta +0.17  (WORSE, tiny)
+    pg19 (long-text):base 17.93  patched 12.00  delta -5.93  (BETTER, big)
+  INTERPRETATION (honest):
+    - mLSTM WINS big on long-text (pg19 -5.9 ppl) -> it IS
+      carrying long-range memory. The step-2200 flip (-4.46) held
+      and strengthened to -5.93 at step10000.
+    - Neutral on code (+0.17, ~noise).
+    - Worse on out-of-domain short WikiText (+7.76): expected
+      trade — the model SPECIALIZES for long-context recall at the
+      cost of generic short-text fluency. WikiText is a poor proxy
+      (not the training distribution) so don't over-weight it.
+  The "slight decrease until we fine-tune" prediction is confirmed
+  but with a TWIST: it's not uniform — long-text IMPROVES,
+  short-text degrades. That's the specialization we want to then
+  SHARPEN in Stage2 (SFT) + Stage3 (GRPO).
+  (Variable-context extrapolation probe at L=4096 on this ckpt
+   was running at session end — see runs/eval_vctx_step10000.log.)
+
+### (i) VARIABLE-CONTEXT PROBE on step10000 ckpt (the "limit" answer)
+  Ran `variable_context_eval` (parallel fwd at increasing
+  prefix L, next-tok ppl on following 256 tok) on the
+  NEW checkpoints/xlstm_cpt_step10000.pt (3 books, eval_len256):
+    L=1024:  base 4.60   patch 3.93   delta -0.68  (BETTER)
+    L=2048:  base 10.78  patch 13.24  delta +2.46  (WORSE)
+    L=4096:  base 11.50  patch 15.03  delta +3.53  (WORSE)
+  HONEST READING (this is the real "find the limit" answer):
+    - The graft HELPS at moderate prefix (L=1024: -0.68).
+    - It HURTS at very-long prefix (L=2048/4096: +2.46/+3.53).
+    - This CONTRADICTS the quick_eval pg19 number
+      (-5.93 "BETTER") — because they measure different
+      things: quick_eval uses 512-tok chunks (short context);
+      variable_context uses a 1024-4096-tok PREFIX (long
+      context). The graft's benefit is CONTEXT-LENGTH-DEPENDENT
+      and currently peaks at ~moderate length.
+    - ROOT: the mLSTM was TRAINED at context 2048 (parallel).
+      At prefix > 2048 its internal dynamics go
+      OUT-OF-DISTRIBUTION and inject noise -> patched ppl
+      RISES above base. So the paper's "helps at 16384"
+      claim is NOT demonstrated on our setup yet.
+    - The paper achieves long-context win via RECURRENT DECODE
+      at inference (train 2048, recurrent-infer 16384). OUR
+      recurrent decode is BLOCKED by the RoPE bug (10d), so
+      we can't even run that path. UNTIL 10d is fixed, the
+      "mLSTM helps at very long context" result is UNREACHABLE
+      here — parallel eval at >2048 just shows OOD degradation.
+  CONCLUSION: training at 2048 context bought us moderate-
+  length long-text help (quick_eval -5.9, vctx L=1024 -0.68)
+  but NOT the paper's extrapolation win. To get there:
+    (1) FIX the recurrent RoPE bug (10d) -> test true
+        constant-state decode at 16384, OR
+    (2) train at LONGER context (bump xlstm.context_length +
+        seq_len) so >2048 isn't OOD. Costs more VRAM/time.
+  This is the single most important next step.
+
